@@ -1,16 +1,11 @@
 # Dependencies
 node_modules/
 
-# Coverage artefacts produced by the test run
+# Coverage artefacts (see jest.config.js: coverageDirectory)
 coverage/
 
 # Logs
-*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-logs/
-
-# OS / editor noise
-.DS_Store
-Thumbs.db
+*.log
