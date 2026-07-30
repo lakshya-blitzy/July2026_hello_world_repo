@@ -6,20 +6,18 @@
  * STUB MODE, AND IT OPENS NOTHING. This file creates no socket, no server, no child process and
  * no timer. The stub harness swaps the HTTP server factory for a fake whose `listen` merely
  * RECORDS its arguments, so the intended host and port can be asserted while the fixed port they
- * name stays genuinely free for the one tier that really binds it.
+ * name is left free. Loading the subject for real would bind that address, so this tier never
+ * does (contract D2).
  *
  * `server.js` is REFERENCE ONLY - never modified, never loaded from here. The harness loads it on
  * our behalf by an absolute path resolved from the runner root, so nothing in this file depends
  * on its own depth in the tree.
  *
- * Three contracts shape every case below, each one a defect that was observed before it was
- * engineered out:
- *   D2 - a real load of the subject binds a fixed address, so real loading is confined to
- *        test/e2e/bootstrap.test.js. Stub mode is the only mode used here.
+ * Two harness contracts shape the readiness cases below:
  *   D6 - the fake's `listen` DEFERS its callback, so the readiness banner does not exist yet when
  *        the synchronous capture returns. Every readiness assertion therefore awaits the async
  *        ready variant, which flushes the deferred callback by draining the queue - never by
- *        waiting on the clock. The last case pins that behaviour down deliberately.
+ *        waiting on the clock.
  *   D7 - captured stdout is a plain array snapshotted at capture time, because the runner clears
  *        and restores mock state between tests. Spy internals are never read at assertion time.
  *
@@ -78,8 +76,6 @@ function responseDouble() {
     endArgs: undefined
   };
 
-  // The recorders close over `res` rather than leaning on `this`, so they keep recording however
-  // the handler happens to reach them.
   res.setHeader = (...args) => {
     res.setHeaderCalls.push(args);
   };
@@ -108,7 +104,6 @@ function throwingRequest() {
       get() {
         throw new Error('handler must not read req.' + key);
       },
-      // Left configurable so the double stays inspectable under a debugger.
       configurable: true
     });
   });
@@ -154,7 +149,6 @@ describe('request handler', () => {
   test('accepts exactly two arguments (F-001-RQ-001)', () => {
     captured = captureHandler();
 
-    // One handler serves every request, and its declared arity is the request/response pair.
     expect(typeof captured.handler).toBe('function');
     expect(captured.handler.length).toBe(2);
   });
@@ -211,9 +205,9 @@ describe('module bootstrap and readiness log', () => {
     // Argument order mirrors the subject's own call - PORT FIRST, host second. Reading them the
     // other way round would still pass a sloppy assertion while proving nothing.
     //
-    // No socket exists at this point: the fake's `listen` records what it was handed and returns.
-    // That is exactly why this tier can assert the intended endpoint and still leave the fixed
-    // port free for the one tier that genuinely binds it.
+    // No socket exists at this point: the fake's `listen` records what it was handed and returns,
+    // which is what lets this tier assert the intended endpoint and still leave the fixed port
+    // free.
     expect(captured.recordedPort).toBe(EXPECTED.PORT);
     expect(captured.recordedHost).toBe(EXPECTED.HOST);
   });
@@ -228,8 +222,6 @@ describe('module bootstrap and readiness log', () => {
     expect(captured.logs[0]).toBe(
       'Server running at http://' + captured.recordedHost + ':' + captured.recordedPort + '/'
     );
-
-    // And the composed result is the frozen expectation, closing the loop.
     expect(captured.logs[0]).toBe(EXPECTED.READY_LINE);
   });
 
