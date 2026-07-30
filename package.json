@@ -1,0 +1,30 @@
+{
+  "name": "july2026_hello_world_repo",
+  "version": "1.0.0",
+  "description": "Minimal Node.js HTTP server that responds to every request with a plain-text greeting.",
+  "main": "server.js",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": "^22.0.0 || >=24.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "jest",
+    "test:ci": "jest --ci --runInBand --detectOpenHandles",
+    "test:coverage": "jest --coverage",
+    "test:unit": "jest test/unit",
+    "test:integration": "jest test/integration",
+    "test:e2e": "jest test/e2e",
+    "test:watch": "jest --watch",
+    "test:debug": "node --inspect-brk node_modules/.bin/jest --runInBand"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "jest": "30.4.2",
+    "supertest": "7.2.2"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.8"
+  }
+}
