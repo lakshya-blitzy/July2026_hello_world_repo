@@ -1,106 +1,63 @@
 /**
- * Jest runner configuration for the July2026 hello-world HTTP server.
+ * Jest runner configuration for this repository's HTTP server test suite.
  *
- * This is the only configuration file in the suite: it carries the runner, the
- * assertion and mocking hygiene, the coverage instrumentation and the enforcing
- * coverage threshold together. Every option below exists for a demonstrated
- * reason — most were discovered by running the suite design and watching it
- * fail — so each is annotated with the standard (S-*) or implementation
- * contract (D-*) that mandates it. Nothing here is decorative.
+ * This is the only configuration file: it carries the runner, the assertion and
+ * mocking hygiene, the coverage instrumentation and the enforcing coverage
+ * threshold together.
  *
- * Subject under test: `server.js`, a 14-line module whose `listen()` call runs
- * as an unconditional side effect of `require()`. That single property drives
- * most of the settings below: real binding of 127.0.0.1:3000 must never happen
- * concurrently, coverage must be scoped to that one file, and mock state must
- * never be read lazily after a hook has cleared it.
+ * The subject under test is `server.js`, whose `listen()` call runs as an
+ * unconditional side effect of `require()`. That single property shapes most of
+ * the settings below: a real load binds the fixed address 127.0.0.1:3000, so
+ * such loads cannot run concurrently; coverage is scoped to that one file; and
+ * captured mock state has to be read eagerly rather than after a hook has
+ * cleared it.
  *
- * Discovered tiers (five files, one shared behavioural contract):
- *   test/unit/*.test.js         binds nothing at all
- *   test/integration/*.test.js  ephemeral port 0
- *   test/e2e/bootstrap.test.js  the SOLE binder of 127.0.0.1:3000
- *   test/e2e/lifecycle.test.js  child process on a shifted port
+ * Two options are deliberately absent, and their absence is load-bearing:
  *
- * Deliberately ABSENT options, each recorded as an anti-regression note. They
- * are described rather than named so that a mechanical audit of this file finds
- * zero occurrences of the option keys it must never contain:
+ *   1. The flag that forcibly terminates the runner after the last assertion.
+ *      A runner that will not exit is reporting a leaked handle inside a test
+ *      helper; that flag hides the leak instead of resolving it.
+ *   2. A coverage-instrumentation override, so the default Babel/Istanbul
+ *      instrumenter applies. It accounts for the subject's two functions,
+ *      whereas the V8 instrumenter accounts for none and would make the
+ *      functions threshold below vacuous.
  *
- *   1. The flag that forcibly terminates the runner after the last assertion is
- *      FORBIDDEN by standard S-3 and implementation contract D1. It conceals
- *      leaked handles, which is precisely the defect class the suite's
- *      unconditional teardown exists to catch. A runner that will not exit is
- *      reporting a leak inside a test helper: fix the helper, never silence the
- *      symptom here. The suite is proven to exit cleanly under open-handle
- *      detection without it.
- *   2. No coverage-instrumentation override is declared, so the default
- *      Babel/Istanbul instrumenter applies. That instrumenter accounts for the
- *      subject's 2 functions (with 9 statements, 0 branches and 9 lines),
- *      whereas the alternative V8 instrumenter reports 0 functions and would
- *      render the 100% functions gate below vacuous. The default also matches
- *      the figures published in the project specification.
- *   3. No ignore list for discovered test paths is declared. The root-level
- *      placeholder that used to match Jest's default discovery glob has been
- *      deleted, and the explicit discovery pattern below already excludes it;
- *      such a list is a documented contingency third layer only.
- *   4. No global or file-level setup and teardown hooks are registered. Every
- *      resource — server, socket, child process, temporary directory — is
- *      acquired and released inside the test that needs it, on an unconditional
- *      teardown path, so there is no shared bootstrap state to install.
- *   5. No module rewriting, path aliasing or bundled base-configuration layer
- *      is configured. The subject and the entire suite are plain CommonJS, so
- *      no compilation step is required.
- *   6. No reporting-detail, early-exit, order-randomisation, custom-sequencer
- *      or cache-location overrides are configured. Each would alter reporting
- *      or ordering semantics that the suite's determinism guarantees depend on.
- *
- * @see server.js — the immutable behavioural contract every assertion derives
- *      from. Coverage only ever READS it (standard S-1).
+ * @see server.js — the behavioural contract the suite asserts against. It is
+ *      reference-only: coverage instrumentation reads it, nothing writes it.
  */
 
 /** @type {import('jest').Config} */
 module.exports = {
-  // No DOM is involved anywhere in this system. Resolved from the framework
-  // install by the transitively supplied `jest-environment-node`, which is
-  // deliberately NOT declared as a dependency of its own.
+  // No DOM is involved anywhere in this system. The environment itself arrives
+  // transitively with the framework and needs no dependency entry of its own.
   testEnvironment: 'node',
 
-  // Defence in depth against a proven hazard, not a stylistic choice. A
-  // 13-byte root-level `test.js` holding two bare identifiers matched Jest's
-  // DEFAULT discovery glob and failed at load with a ReferenceError, producing
-  // one failed suite and zero tests. Scoping discovery to the tiered suite
-  // directories selects only the intended files, and keeps doing so even if
-  // such a file were ever reintroduced at the repository root.
+  // Discovery is restricted to the tiered test tree instead of being left to
+  // Jest's default glob, so a file elsewhere in the repository whose basename
+  // merely resembles a test name is never collected.
   testMatch: ['<rootDir>/test/**/*.test.js'],
 
-  // Contract D2, a reproduced defect: two files loading the subject under two
-  // workers failed with EADDRINUSE on port 3000, while the same files passed
-  // under a single worker. Standard S-4. The suite additionally confines all
-  // real module loading to test/e2e/bootstrap.test.js, so the guarantee is
-  // structural as well as configured — do not raise this while that remains
-  // the case. The `test:ci` script also passes --runInBand; both are wanted.
+  // A real load of the subject binds the fixed address 127.0.0.1:3000, so two
+  // workers loading it in parallel collide with EADDRINUSE. The suite also
+  // restricts real loading to one test file, which makes the guarantee
+  // structural as well as configured. The `test:ci` script additionally passes
+  // --runInBand; both are wanted.
   maxWorkers: 1,
 
-  // A SAFETY BOUND for the child-process tier, never a synchronisation
-  // mechanism (standard S-2 forbids waiting on wall-clock time). The full
-  // suite completes in well under two seconds; this ceiling exists so a
-  // genuinely stuck await fails loudly instead of hanging the run. Contract D3
-  // originated in exactly such a hang, which ran to 20,003 ms before the
-  // already-exited child case was guarded and completed in 136 ms.
+  // A safety bound for the child-process tier, never a synchronisation
+  // mechanism: nothing in the suite waits on wall-clock time. The ceiling
+  // exists so a stuck await fails loudly instead of hanging the run.
   testTimeout: 20000,
 
-  // The strictest hook hygiene available, enabled deliberately BECAUSE it
-  // exposed contracts D5 and D7 during validation. The readiness line is
-  // emitted from the listen callback and is therefore asynchronous relative to
-  // require(), so a spy's recorded calls read at assertion time were found
-  // wiped by automatic clearing. The remedy belongs in the helpers — snapshot
-  // captured output at capture time, never expose it as a getter over mock
-  // state — so do NOT disable either flag to make a test pass.
+  // The strictest hook hygiene available: mock state is cleared and restored
+  // between tests. Anything a helper captures through a spy must therefore be
+  // snapshotted at capture time and exposed as a plain value, because an
+  // accessor that reads mock state at assertion time finds it wiped.
   clearMocks: true,
   restoreMocks: true,
 
-  // Instrumentation is scoped to the subject ALONE so helper, fixture and
-  // configuration code cannot inflate the figures. Exactly one entry: adding
-  // any further glob would break standard S-8's guarantee that the gate
-  // measures the subject and nothing else.
+  // Instrumentation is scoped to the subject alone, so helper, fixture and
+  // configuration code cannot inflate the figures.
   collectCoverage: true,
   collectCoverageFrom: ['server.js'],
 
@@ -110,15 +67,12 @@ module.exports = {
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'text-summary', 'lcov', 'json-summary'],
 
-  // Standard S-8 — an enforcing gate, derived from measurement rather than
-  // convention. Istanbul instrumentation of the subject reports exactly 9
-  // statements, 0 branches, 2 functions and 9 lines, and the suite reaches
-  // 100% on all four, so the ceiling is attainable rather than aspirational.
-  // The `functions` metric is the meaningful one: the second function is the
-  // listen callback, reachable only when a bind genuinely succeeds, so a
-  // passing run is itself evidence that startup was really exercised. A
-  // negative control (passing assertions that never load the subject) exits
-  // non-zero here. NEVER lower these numbers to make a run pass.
+  // An enforcing gate derived from measurement rather than convention: Istanbul
+  // instrumentation of the subject accounts for 9 statements, 0 branches, 2
+  // functions and 9 lines, so a 100% ceiling is attainable rather than
+  // aspirational. `functions` is the metric that carries meaning here — the
+  // second function is the listen callback, reachable only when a bind
+  // succeeds, so satisfying it requires exercising startup for real.
   coverageThreshold: {
     global: {
       statements: 100,
