@@ -1,10 +1,9 @@
 {
   "name": "july2026_hello_world_repo",
   "version": "1.0.0",
-  "description": "Minimal Node.js HTTP server that responds to every request with a plain-text greeting.",
-  "main": "server.js",
+  "description": "Minimal Node.js HTTP server with a Jest test suite",
   "private": true,
-  "license": "MIT",
+  "main": "server.js",
   "engines": {
     "node": "^22.0.0 || >=24.0.0"
   },
