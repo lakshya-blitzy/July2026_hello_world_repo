@@ -42,8 +42,10 @@
  * reason: a runner that will not exit is reporting a leak to be fixed on the teardown path below.
  */
 
+const fs = require('fs');
 const http = require('http');
 const net = require('net');
+const nodeModule = require('module');
 const { loadServer, loadServerReady } = require('../helpers/loadServer');
 const httpClient = require('../helpers/httpClient');
 const expected = require('../fixtures/expected');
@@ -82,6 +84,41 @@ const IPV4_FAMILY = 'IPv4';
  * @type {string}
  */
 const ERROR_BRAND = '[object Error]';
+
+/**
+ * The one module specifier the subject is permitted to name.
+ *
+ * Stated here rather than in the frozen fixture because it describes the subject's DEPENDENCY
+ * SHAPE, not a value it puts on the wire, and this is the only tier that interrogates that shape.
+ *
+ * @type {string}
+ */
+const ONLY_SPECIFIER = 'http';
+
+/**
+ * Every `require(...)` call in a source text, as the specifiers it names.
+ *
+ * Single-quoted literals only, which is exactly what the subject's style uses: a dynamic or
+ * computed specifier would deliberately NOT be matched here, and would instead be caught by the
+ * total-call count the case below asserts alongside this list. Reading the file rather than
+ * introspecting the loaded module is what makes this a statement about the subject's SHAPE, which
+ * is unaffected by whichever registry the runner happens to load it through.
+ *
+ * @param {string} source The subject's source text.
+ * @returns {string[]} The specifiers named by single-quoted require calls, in source order.
+ */
+function requireSpecifiers(source) {
+  const specifiers = [];
+  const pattern = /\brequire\(\s*'([^']*)'\s*\)/g;
+  let match = pattern.exec(source);
+
+  while (match !== null) {
+    specifiers.push(match[1]);
+    match = pattern.exec(source);
+  }
+
+  return specifiers;
+}
 
 /**
  * The harness snapshot owned by the case currently running, or `null` between cases.
@@ -274,6 +311,40 @@ describe('bootstrap (L4)', () => {
     expect(Object.keys(subjectModule).length).toBe(0);
     expect(subjectModule.server).toBeUndefined();
     expect(subjectModule.handler).toBeUndefined();
+  });
+
+  test('depends on nothing but a single built-in module (F-005-RQ-001)', () => {
+    // Loaded first, and deliberately: reading the file the harness itself resolved is what ties
+    // this structural claim to the module that actually ran, rather than to a path restated here
+    // and hoped to be the same one.
+    loaded = loadServer();
+
+    const source = fs.readFileSync(loaded.subjectPath, 'utf8');
+    const specifiers = requireSpecifiers(source);
+
+    // Exactly one require, and it names the built-in HTTP module. Asserted as the COMPLETE list,
+    // so a second import fails the case instead of slipping past a check for the first one.
+    expect(specifiers).toStrictEqual([ONLY_SPECIFIER]);
+
+    // The total number of require CALLS is counted separately from the specifiers extracted above,
+    // because a computed or double-quoted specifier would be invisible to the extraction while
+    // still being a dependency. The two counts agreeing is what closes that gap.
+    expect(source.match(/\brequire\s*\(/g)).toHaveLength(1);
+
+    // Built-in, so nothing has to be installed for the subject to resolve it - which is the
+    // property that lets the application run from a bare checkout at all.
+    expect(nodeModule.isBuiltin(specifiers[0])).toBe(true);
+    expect(nodeModule.builtinModules).toContain(specifiers[0]);
+
+    // No second module system either: an ESM import declaration or a dynamic import would be a
+    // dependency the require count above could never see.
+    expect(source).not.toMatch(/^\s*import\s/m);
+    expect(source).not.toMatch(/\bimport\s*\(/);
+    expect(source).not.toMatch(/\bfrom\s+['"]/);
+
+    // The intercepted factory is the one this specifier resolves to, so the single built-in the
+    // source names is demonstrably the module the subject actually used.
+    expect(loaded.createServerCalls).toBe(1);
   });
 
   test('emits close when the server is closed (F-002-RQ-005)', async () => {

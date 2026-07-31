@@ -397,6 +397,102 @@ function probeBind(host, port) {
 }
 
 /**
+ * The operating system's process table, read as a filesystem.
+ *
+ * Reading it is a file read rather than a shell-out, which keeps the single-process scenario in
+ * line with this tier's rule that no external utility is required and no extra process is put on
+ * the assertion path. Its presence is a property of the HOST, so the scenario that depends on it
+ * is DECLARED conditionally below rather than deciding at run time whether to assert anything.
+ *
+ * @type {string}
+ */
+const PROC_TABLE = '/proc';
+
+/**
+ * The APIs whose mere MENTION in the executed code would open the door to a second process.
+ *
+ * Absence of every one of them is a structural proof that no fork, no worker, no cluster and no
+ * daemonisation path exists to be taken - stronger than observing that none happened on one run.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+const PROCESS_MULTIPLYING_APIS = Object.freeze([
+  'child_process',
+  'worker_threads',
+  'cluster',
+  'fork',
+  'detached',
+  'setsid',
+  'unref'
+]);
+
+/**
+ * One process's parentage and process group, or null when it has no entry.
+ *
+ * Null means "not observable here": either the process has gone, or this host exposes no process
+ * table at all - and the second of those is what the declaration-time gate below tests for. Any
+ * other read failure is re-thrown, because an outcome nobody anticipated must fail loudly rather
+ * than be waved through as an absence.
+ *
+ * EACCES is tolerated for the same reason ENOENT is: a process this user cannot inspect is by
+ * definition not a child of this runner, so it can never be the one being looked for.
+ *
+ * @param {number} pid The process to describe.
+ * @returns {?{state: string, ppid: number, pgrp: number}} Its entry, or null.
+ */
+function readProcessEntry(pid) {
+  let raw;
+
+  try {
+    raw = fs.readFileSync(path.join(PROC_TABLE, String(pid), 'stat'), 'utf8');
+  } catch (readError) {
+    if (readError.code === 'ENOENT' || readError.code === 'ESRCH' ||
+        readError.code === 'EACCES') {
+      return null;
+    }
+    throw readError;
+  }
+
+  // The executable name is parenthesised and may itself contain spaces and parentheses, so the
+  // fields are taken from AFTER THE LAST ')' rather than by splitting the whole line - which is
+  // exactly the parse that a naive whitespace split gets wrong.
+  const fields = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/);
+
+  return { state: fields[0], ppid: Number(fields[1]), pgrp: Number(fields[2]) };
+}
+
+/**
+ * The pids whose parent is the given process, in ascending order.
+ *
+ * A process that ends between the listing and the read simply has no entry by then and is
+ * skipped, so the scan cannot fail on a table that is changing underneath it.
+ *
+ * @param {number} pid The parent to look for.
+ * @returns {number[]} Its immediate children.
+ */
+function childPidsOf(pid) {
+  return fs.readdirSync(PROC_TABLE)
+    .filter((entry) => /^\d+$/.test(entry))
+    .map(Number)
+    .filter((candidate) => {
+      const entry = readProcessEntry(candidate);
+      return entry !== null && entry.ppid === pid;
+    })
+    .sort((first, second) => first - second);
+}
+
+/**
+ * The runner for the single-process scenario.
+ *
+ * A host without a readable process table cannot demonstrate parentage or the absence of
+ * descendants, and silently passing a case that asserted nothing would be worse than reporting it
+ * as skipped - the same reasoning, and the same mechanism, as the loopback-confinement scenario.
+ *
+ * @type {Function}
+ */
+const testWithProcessTable = readProcessEntry(process.pid) === null ? test.skip : test;
+
+/**
  * Unconditional teardown: this runs after a FAILING case exactly as it does after a passing one,
  * which is what guarantees no child, no pipe and no generated directory outlives the case that
  * created it - and therefore that the next case, and the next file, start from a clean host.
@@ -653,4 +749,54 @@ describe('lifecycle (L5)', () => {
     // directory, and that directory is gone.
     expect(fs.existsSync(handle.dir)).toBe(false);
   });
+
+  testWithProcessTable(
+    'S8 runs as a single foreground process that neither forks nor detaches (F-005-RQ-004)',
+    async () => {
+      const handle = track(spawnServer());
+      await handle.ready;
+
+      // Read back from the GENERATED COPY rather than from the subject, so this describes the code
+      // that actually ran in the child.
+      const executed = fs.readFileSync(handle.file, 'utf8');
+
+      // Filtered rather than asserted one API at a time, so a failure names the offending API
+      // instead of merely reporting that something matched.
+      expect(
+        PROCESS_MULTIPLYING_APIS.filter((api) => executed.indexOf(api) !== -1)
+      ).toStrictEqual([]);
+
+      const child = readProcessEntry(handle.child.pid);
+      const runner = readProcessEntry(process.pid);
+
+      expect(child).not.toBeNull();
+      expect(runner).not.toBeNull();
+
+      // Still THIS runner's own child, and still in the runner's process group: a process that had
+      // daemonised itself would have been re-parented away, and one that had detached would have
+      // left the group. Together these are what "foreground" means at the operating-system level.
+      expect(child.ppid).toBe(process.pid);
+      expect(child.pgrp).toBe(runner.pgrp);
+
+      // One process, not a leader with workers behind it.
+      expect(childPidsOf(handle.child.pid)).toStrictEqual([]);
+
+      // "Single" made consequential: that one process is the one serving, so it is the only thing
+      // that has to be terminated. Asserted before the signal, so the address below is known to
+      // have been genuinely occupied by it.
+      const response = await httpClient.get(handle.port);
+      expect(response.status).toBe(expected.STATUS);
+      expect(response.body).toBe(expected.BODY);
+
+      await handle.stop(TERMINATION_SIGNAL);
+      expect(handle.hasExited()).toBe(true);
+
+      // Nothing outlived it. A surviving fork or a detached daemon would still be holding the
+      // address, so a free bind here is the positive evidence that the process was alone - and the
+      // pid is checked against the runner's CURRENT children rather than against the process table
+      // as a whole, so a recycled pid cannot be mistaken for a survivor.
+      expect(childPidsOf(process.pid)).not.toContain(handle.child.pid);
+      expect(await probeBind(expected.HOST, handle.port)).toBe(FREE);
+    }
+  );
 });
