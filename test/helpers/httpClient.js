@@ -10,6 +10,14 @@
  * and get(port, path), each resolving exactly { status, headers, body }; only
  * `port` is required, and every option is detailed on the functions below.
  *
+ * EVERY OPTION IS VALIDATED BEFORE A REQUEST EXISTS, AND VALIDATION FAILS
+ * CLOSED. The port must be an integer in 1..65535 and a supplied host must be a
+ * non-empty string, so a mistyped destination rejects here rather than being
+ * coerced by the runtime or - worse - defaulted back to loopback, which would
+ * turn the loopback-confinement scenario's expected refusal into a 200 against
+ * the local server. Nothing is created before these checks pass, so a rejection
+ * on this path leaves nothing to release.
+ *
  * EVERY FAILURE RELEASES THE REQUEST. One internal failure path destroys the
  * ClientRequest before rejecting, because a request that is created and then
  * abandoned keeps a live server-side connection: an invalid `body` would reject
@@ -35,6 +43,26 @@
  */
 
 const http = require('http');
+
+/**
+ * Loopback default for the destination host, matching the subject's bind address.
+ *
+ * Applied ONLY when `host` is omitted altogether. A supplied host is validated and then used
+ * verbatim - it is never replaced by this default - because the loopback-confinement scenario
+ * aims deliberately at the machine's routable address and needs that request to be refused
+ * rather than silently redirected back to loopback. The port is pointedly NOT defaulted: port
+ * ownership belongs to the calling tier (standard S-5), not to this helper.
+ */
+const DEFAULT_HOST = '127.0.0.1';
+
+/**
+ * Lowest and highest values a TCP port number may take.
+ *
+ * Named rather than inlined so the bound this helper enforces is the same one a reader can
+ * check against the protocol, and so the two comparisons below cannot drift apart.
+ */
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
 
 /**
  * Default ceiling on the accumulated response body, in bytes (1 MiB).
@@ -74,16 +102,26 @@ function isWritableBody(value) {
  *
  * @param {Object} options                Single object argument; there is no
  *                                        positional variant of this function.
- * @param {number} options.port           REQUIRED. Never defaulted here: port
- *                                        ownership is a property of the calling
- *                                        tier, not of this helper (standard
- *                                        S-5). A missing port rejects with a
- *                                        clear misuse Error.
- * @param {string} [options.host]         Defaults to the loopback address.
- *                                        Overridable, because the loopback
- *                                        confinement scenario aims at the
- *                                        host's routable address and expects
- *                                        ECONNREFUSED.
+ * @param {number} options.port           REQUIRED, and required to be an
+ *                                        integer in 1..65535. Never defaulted
+ *                                        here: port ownership is a property of
+ *                                        the calling tier, not of this helper
+ *                                        (standard S-5). A missing port rejects
+ *                                        with a misuse Error; a non-integer,
+ *                                        numeric-string, or out-of-range value
+ *                                        rejects with a TypeError - both BEFORE
+ *                                        a request exists.
+ * @param {string} [options.host]         Defaults to the loopback address when
+ *                                        OMITTED; a supplied value must be a
+ *                                        non-empty string and is then used
+ *                                        verbatim. Overridable precisely
+ *                                        because the loopback-confinement
+ *                                        scenario aims at the host's routable
+ *                                        address and expects ECONNREFUSED - a
+ *                                        malformed host must therefore fail
+ *                                        loudly rather than fall back to
+ *                                        loopback and turn that refusal into a
+ *                                        200.
  * @param {string} [options.path]         Defaults to '/'.
  * @param {string} [options.method]       Defaults to 'GET'. Passed straight
  *                                        through, so 'HEAD' and any other
@@ -124,6 +162,29 @@ function request(options) {
       return;
     }
 
+    // Documented as a number, so a numeric string, a float, a boolean or an
+    // out-of-range value is misuse. `http.request` would coerce some of those
+    // and refuse others much later - from inside the request, after a socket
+    // exists - so the check is made here, where there is still nothing to
+    // release. Fail closed: a mistyped port must never be silently repaired
+    // into a connectable one.
+    if (!Number.isInteger(opts.port) || opts.port < MIN_PORT || opts.port > MAX_PORT) {
+      reject(new TypeError(
+        'httpClient: options.port must be an integer between ' + MIN_PORT + ' and ' + MAX_PORT
+      ));
+      return;
+    }
+
+    // A host is optional, but a SUPPLIED host must be usable. Without this, an
+    // empty string or a non-string would fall through the default below and be
+    // replaced by loopback, so a request aimed at another address would quietly
+    // succeed against the local server - which is exactly the confusion the
+    // loopback-confinement scenario exists to rule out.
+    if (opts.host !== undefined && (typeof opts.host !== 'string' || opts.host.length === 0)) {
+      reject(new TypeError('httpClient: options.host must be a non-empty string'));
+      return;
+    }
+
     // An unwritable body throws ERR_INVALID_ARG_TYPE from `req.write` AFTER
     // `http.request` has already created the request and begun connecting. The
     // rejection is correct, but the request is then neither ended nor destroyed,
@@ -153,7 +214,10 @@ function request(options) {
       : opts.maxResponseBytes;
 
     const requestOptions = {
-      host: opts.host || '127.0.0.1',
+      // Defaulted only when the key is absent, never when it is falsy: a
+      // supplied host has already been validated above and is passed through
+      // exactly as given.
+      host: opts.host === undefined ? DEFAULT_HOST : opts.host,
       port: opts.port,
       path: opts.path || '/',
       method: opts.method || 'GET',

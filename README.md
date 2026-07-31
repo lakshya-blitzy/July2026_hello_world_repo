@@ -11,19 +11,21 @@ so no source edit is required.
 
 ```bash
 npm ci --ignore-scripts --no-fund --no-audit   # install; needed for the tests only
-CI=true npm test                               # 5 suites, 64 tests, 100% coverage
+CI=true npm test                               # 5 suites, 61 tests, 100% coverage
 ```
 
 | Purpose | Command | Verified outcome |
 | --- | --- | --- |
-| First-time install | `npm install --save-dev --save-exact jest@30.4.2 supertest@7.2.2` | resolves cleanly; generates the lockfile |
-| Clean install (reproducible / pipelines) | `npm ci --ignore-scripts --no-fund --no-audit` | `added 332 packages` |
-| Run the suite | `CI=true npm test` → `jest` | exit 0; 5 suites, 64 tests passed; 100% on all four coverage metrics |
+| First-time install | `npm install --save-dev --save-exact --ignore-scripts --no-fund --no-audit jest@30.4.2 supertest@7.2.2` | `added 297 packages`; pins both at exact versions and generates a `lockfileVersion 3` lockfile |
+| Clean install (reproducible / pipelines) | `npm ci --ignore-scripts --no-fund --no-audit` | `added 303 packages in 1s` |
+| Run the suite | `CI=true npm test` → `jest` | exit 0; 5 suites, 61 tests passed; 100% on all four coverage metrics |
 | Pipeline run | `CI=true npm run test:ci` → `jest --ci --runInBand --detectOpenHandles` | exit 0; **no open-handle warning** |
 | Coverage | `npm run test:coverage` → `jest --coverage` | 100% statements / branches / functions / lines |
-| Tier subsets | `npm run test:unit`, `npm run test:integration`, `npm run test:e2e` | selects only the named tier — 13, 31 and 20 tests |
-| Single file | `npx jest --ci test/e2e/lifecycle.test.js` | 1 suite, 8 tests passed — then see the coverage-gate note below |
-| Single test by name | `npx jest --ci -t "SIGTERM"` | 1 test passed, 63 skipped, 4 suites skipped — same note applies |
+| Tier subsets | `npm run test:unit`, `npm run test:integration`, `npm run test:e2e` | selects only the named tier — 13, 31 and 17 tests |
+| Single file | `npx jest --ci test/e2e/bootstrap.test.js` | 1 suite, 10 tests passed, 100% coverage |
+| Single file, child-process tier | `npx jest --ci test/e2e/lifecycle.test.js` | 1 suite, 7 tests passed — then see the coverage-gate note below |
+| Single test by name | `npx jest --ci -t "SIGTERM"` | 1 test passed, 60 skipped, 4 suites skipped — same note applies |
+| Brace-glob check (after any dependency change) | `node -e "const m=require('minimatch');console.log(m.minimatch('a.js','*.{js,ts}'))"` | `true` — see the override note below |
 | Debug | `npm run test:debug` → `node --inspect-brk node_modules/.bin/jest --runInBand` | attaches an inspector, breaks before the first test |
 | Syntax gate | `node --check server.js` | exit 0 |
 | Audit (whole tree) | `npm audit` | `found 0 vulnerabilities` |
@@ -33,26 +35,47 @@ CI=true npm test                               # 5 suites, 64 tests, 100% covera
 `npm run test:watch` (→ `jest --watch`) is provided for interactive local development only and **MUST
 NEVER be invoked in an automated or non-interactive context — it does not terminate.**
 
+`-t` takes a **regular expression**, and every test title ends in a parenthesised requirement ID, so
+select either on a substring that omits the suffix — `-t "SIGTERM"` — or on the full title with the
+parentheses escaped: `-t "records the intended port and host without binding a socket \(F-002-RQ-001\)"`.
+An unescaped `(F-002-RQ-001)` is read as a capture group and silently matches nothing.
+
 `--ignore-scripts` is mandated: two packages in the resolved tree declare an install script —
 `unrs-resolver@1.12.2`, which is installed on every platform, and `fsevents@2.3.3`, which is optional
 and macOS-only and so is not even fetched here. `.npmrc` sets the flag as the project default so
-every install honours it with or without it being passed. The `overrides` pin of `brace-expansion` to `5.0.8` closes advisory
-GHSA-mh99-v99m-4gvg — a denial of service reached through `minimatch` and `glob`/`test-exclude` —
-taking `npm audit` from 19 high findings to zero.
+every install honours it with or without it being passed.
+
+**Why `overrides` has four entries.** `brace-expansion` is pinned to `5.0.8` to close advisory
+GHSA-mh99-v99m-4gvg, a denial of service reached through `minimatch` and `glob`/`test-exclude`. That
+advisory covers every release up to and including `5.0.7`, so no earlier line is patched and the pin
+cannot be relaxed. But `5.x` moved from a callable default export to named exports, and the versions
+of `minimatch` the runner resolves by default still import the callable form — so pinning that one
+package alone leaves `minimatch`, `glob` and `test-exclude` throwing
+`TypeError: (0 , brace_expansion_1.default) is not a function` on any pattern containing braces. The
+remaining three entries therefore pin the *consumers* to versions that declare `brace-expansion ^5`
+natively: `minimatch@10.2.6`, `test-exclude@8.0.0`, `glob@13.0.6`. Verified afterwards: brace
+patterns expand correctly through all three, `npm audit` and `npm audit --omit=dev` both report
+`found 0 vulnerabilities`, the deprecated `glob@10`/`glob@7` generations are gone (a clean install
+now prints no deprecation notice), and the tree is 29 packages smaller. Run the brace-glob check in
+the table above after changing any dependency — a brace pattern is the one thing a normal run never
+exercises.
 
 **Coverage-gate note.** Coverage is collected on every run and gated at 100%, so a selection that
 never loads `server.js` in-process passes its cases and *then* exits non-zero on the gate. That is
 the gate working, not a failure of the tests: `test/e2e/lifecycle.test.js` drives the server as a
 child process, which contributes nothing to in-process instrumentation. Append `--coverage=false`
 when selecting a single file or a single test by name. The threshold itself is never lowered.
-Measured both ways: `test/e2e/lifecycle.test.js` alone reports 8 passed and exits 1 on the gate, and
-exits 0 with the flag; `-t "SIGTERM"` reports 1 passed / 63 skipped and behaves identically.
+Measured both ways: `test/e2e/lifecycle.test.js` alone reports 7 passed and exits 1 on the gate —
+naming statements, lines and functions at 0% — and exits 0 with the flag; `-t "SIGTERM"` reports
+1 passed / 60 skipped and behaves identically. `test/e2e/bootstrap.test.js` alone needs no flag: it
+loads the subject for real and serves a request, so it reaches 100% on its own.
 
 **Two legitimate case counts.** The loopback-confinement scenario needs a routable IPv4 address to
 prove that the non-loopback interface is refused, so it declares itself through `test.skip` when the
-host has none. Both outcomes are correct and both were measured: **64 passed / 64 total** on a host
-with a routable address, and 63 passed / 1 skipped / 64 total on a host without one. Nothing else in
-the suite varies with the environment.
+host has none. It is the **only** case in the suite whose declaration depends on the environment.
+Both outcomes are correct and both were measured on this host — the second by hiding the routable
+interface from `os.networkInterfaces()`: **61 passed / 61 total** with a routable address, and
+60 passed / 1 skipped / 61 total without one (17 → 16 passed / 1 skipped in the `test:e2e` subset).
 
 ### Test target
 
@@ -62,7 +85,7 @@ cannot inflate the figures. Discovery is scoped to `<rootDir>/test/**/*.test.js`
 
 ```text
 test/
-├── unit/handler.test.js              L1 — handler + listen callback in isolation (subject binds nothing)
+├── unit/handler.test.js              L1 — handler + listen callback in isolation (no socket at all)
 ├── integration/contract.test.js      L2 — wire-level response contract (ephemeral port)
 ├── integration/protocol.test.js      L3 — raw-socket parser/framing behaviour (ephemeral port)
 ├── e2e/bootstrap.test.js             L4 — real require-time bind + shutdown (ONLY binder of 127.0.0.1:3000)
@@ -88,27 +111,34 @@ test/
   post-condition: after a full run **no listening socket remains**. The bootstrap tier releases port
   3000 on an unconditional teardown path, and the lifecycle tier asserts the same for its own fixture
   port with a native bind probe rather than by parsing a socket table.
-- `test/e2e/bootstrap.test.js` (L4) is the only file that binds it *as the subject*, because it is
+- `test/e2e/bootstrap.test.js` (L4) is the **only** file in the suite that binds it, because it is
   the only file that loads `server.js` for real. The port is a hard-coded literal with no override
-  path, so there is nothing to redirect.
-- L1 never lets the subject bind anything — the stub-mode harness records the intended host and port
-  without creating a socket. One case then proves that claim rather than asserting it: while the stub
-  is installed it binds an independent `net.createServer()` probe to `127.0.0.1:3000` and checks the
-  address it was given, which succeeds only if the subject genuinely left the endpoint alone. The
-  probe is built on `net` precisely because `http.createServer` is the stub and would answer it.
-  It is released on an unconditional path, so L1 shares the fixed-port precondition but holds the
-  port only for the moment it takes to prove it was free.
+  path, so there is nothing to redirect. Its first case reads the address back from `address()` on
+  the real server, which is where the kernel-level proof of the endpoint lives.
+- **L1 binds nothing at all** — not the fixed port, not an ephemeral one, no socket of any kind. The
+  stub-mode harness hands the subject a plain recorder whose `listen` only stores its arguments, so
+  the intended host and port can be asserted while the address they name is left untouched. The
+  endpoint case proves that structurally rather than by binding: it inspects the object the subject
+  called `listen` on and shows it has `Object.prototype` for a prototype, exactly the two recording
+  slots and the recording method for own properties, and none of the `address`/`close`/`listening`
+  surface a bound server would carry. `npm run test:unit` therefore has **no port precondition** and
+  passes while another process holds `127.0.0.1:3000` — verified by running it against an external
+  holder.
 - L2 and L3 mount the captured handler on **ephemeral port `0`**.
 - L5 spawns a child process running a runtime-generated, **port-shifted** copy of `server.js` written
   into a temporary directory and removed unconditionally afterwards. The shifted port is deliberately
   four digits, so the readiness line stays exactly 41 bytes.
-- A pipeline agent that pre-binds port 3000 will fail the bootstrap tier.
+- A pipeline agent that pre-binds port 3000 will fail the bootstrap tier and nothing else. The unit,
+  contract, protocol and lifecycle tiers are unaffected: none of them touches that address.
 - The runner is pinned to a single worker (`maxWorkers: 1`) because parallel workers were observed
   colliding on the fixed port. Do not raise it while a test file still loads `server.js` for real.
 
-**If something else already holds the port.** Every bootstrap case fails with
-`listen EADDRINUSE: address already in use 127.0.0.1:3000` while the other four suites still pass.
-The remedy is to free the port, never to change it: `server.js` hard-codes the endpoint and is the
+**If something else already holds the port.** Measured with an external holder on
+`127.0.0.1:3000`: **9 of the 10 bootstrap cases fail** with
+`listen EADDRINUSE: address already in use 127.0.0.1:3000`, the tenth passes because it is purely
+structural and never needs the bind to succeed, and **all four other suites pass** — 52 passed /
+9 failed / 61 total, one failed suite. The remedy is to free the port, never to change it:
+`server.js` hard-codes the endpoint and is the
 behavioural contract this suite asserts, so it is read and never edited. The usual holders are a
 stray `node server.js` left behind by an earlier `npm start` and a second checkout of this
 repository running its own bootstrap tier at the same moment. Check the port with a bind probe
@@ -168,11 +198,12 @@ they are asserted on their response bytes and are never treated as thrown or rej
 
 ### Provenance
 
-Measured rather than estimated, on **Node.js 24.18.1 / npm 11.18.0**: 64 tests across 5 suites in
-0.881 s of runner time (1.386 s under `test:ci`); 332 installed packages; 0 audit findings on the whole
-tree and on the production tree; 100% on all four coverage metrics (9/9, 0/0, 2/2, 9/9); the 14-byte
-body with digest `c98c24b6…ad31`; and the 41-byte readiness line. The installed `jest` package is
-30.4.2 while its CLI self-reports 30.4.1, because the constituent packages version independently.
+Measured rather than estimated, on **Node.js 24.18.1 / npm 11.18.0**: 61 tests across 5 suites in
+0.699 s of runner time (1.166 s under `test:ci`); 13 / 31 / 17 tests in the unit, integration and
+e2e subsets; 303 installed packages from 331 lockfile entries; 0 audit findings on the whole tree and
+on the production tree; 100% on all four coverage metrics (9/9, 0/0, 2/2, 9/9); the 14-byte body with
+digest `c98c24b6…ad31`; and the 41-byte readiness line. The installed `jest` package is 30.4.2 while
+its CLI self-reports 30.4.1, because the constituent packages version independently.
 
 `server.js` was **not modified** by this work — its SHA-256 remains
 `332fc2d04eb5b8f3cb230855457af80d0dfc246f958d6e49615610d656acc2e0`, byte-identical to the committed

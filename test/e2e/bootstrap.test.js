@@ -35,12 +35,21 @@
  * gone through that factory first, the harness's first recorded call would be the blocker's and
  * every snapshot would describe the wrong server.
  *
- * MOCK OWNERSHIP IS REFERENCE-SPECIFIC, AND THE LAST CASE PROVES IT. The harness restores the two
- * spies it installed - the HTTP server factory and the console - by reference, and never touches a
- * mock it did not install. That matters because a case here may legitimately install a spy of its
- * own and still need it after the harness has been torn down, which happens mid-test as well as
- * from the unconditional teardown below. The final case is the executable regression guard for
- * that contract.
+ * MOCK OWNERSHIP IS REFERENCE-SPECIFIC, AND THE INTERCEPTION CASE PROVES IT. The harness restores
+ * the two spies it installed - the HTTP server factory and the console - by reference, and never
+ * touches a mock it did not install. That matters because a case here may legitimately install a
+ * spy of its own and still need it after the harness has been torn down, which happens mid-test as
+ * well as from the unconditional teardown below. The case that counts the factory invocations is
+ * also the executable regression guard for that contract, so the interception it describes and the
+ * ownership discipline that interception depends on are asserted together.
+ *
+ * THE STRUCTURAL CASE INTERROGATES THE SUBJECT'S SHAPE, NOT ONLY ITS EXPORTS. What a module
+ * exposes and what it depends on are two halves of one structural claim, and this tier is where
+ * the AAP maps both: an exports object with zero own keys, and a source text naming exactly one
+ * specifier which is a built-in. Reading that source text is why `fs` is imported, and confirming
+ * the specifier is built in rather than installed is why `module` is - both used by that one case
+ * and nowhere else. Reading the FILE rather than introspecting the loaded module keeps the claim
+ * about the subject itself, whichever registry entry the runner happens to serve it from.
  *
  * REPORT, DO NOT REPAIR: `server.js` registers no 'error' listener, so a failed bind is an
  * unhandled 'error' event. The bind-failure case asserts that gap as CURRENT behaviour. The
@@ -104,7 +113,7 @@ const ERROR_BRAND = '[object Error]';
 const ONLY_SPECIFIER = 'http';
 
 /**
- * Sentinels for the mock-ownership regression case.
+ * Sentinels for the mock-ownership half of the interception case.
  *
  * Test-local values with no relationship whatsoever to the subject, which is exactly the point:
  * the spy that returns them belongs to the TEST, so the harness must leave it precisely as it
@@ -256,6 +265,18 @@ describe('bootstrap (L4)', () => {
   });
 
   test('creates exactly one HTTP server (F-001-RQ-001)', async () => {
+    // A spy that belongs to the TEST, installed BEFORE the harness runs and still needed after it
+    // has finished. Nothing about it relates to the subject - it exists to hold the harness to its
+    // ownership contract, which is what makes the interception assertions below trustworthy in the
+    // first place: a harness that restored mocks indiscriminately would be reaching outside what
+    // it installed, and the isolation standard the whole tier rests on (S-4) would be unenforced.
+    const target = {
+      probe() {
+        return NOT_SPIED;
+      }
+    };
+    const targetSpy = jest.spyOn(target, 'probe').mockReturnValue(OWNED_BY_TEST);
+
     loaded = await loadServerReady();
 
     // A plain number snapshotted at load time, never a read of spy state (contract D7). One call
@@ -269,6 +290,25 @@ describe('bootstrap (L4)', () => {
     // the runtime invokes it with.
     expect(typeof loaded.handler).toBe('function');
     expect(loaded.handler.length).toBe(2);
+
+    // Torn down explicitly, MID-TEST, which is precisely the situation the harness's ownership
+    // contract has to survive: a blanket restore-all inside its teardown would uninstall the spy
+    // above before this case could use it again. The unconditional teardown in `afterEach` is
+    // idempotent, so calling it here costs nothing later.
+    await loaded.teardown();
+
+    // The harness DID restore what it owns - its console spy is gone. The runner's own automatic
+    // restoration cannot account for this, because that is applied in a top-level `beforeEach`,
+    // i.e. at the start of the NEXT test, not at the end of this one.
+    expect(jest.isMockFunction(console.log)).toBe(false);
+
+    // ...and it left the test's own spy exactly as it found it.
+    expect(jest.isMockFunction(target.probe)).toBe(true);
+    expect(target.probe()).toBe(OWNED_BY_TEST);
+
+    // Restored by its owner, which is the whole point of the contract.
+    targetSpy.mockRestore();
+    expect(target.probe()).toBe(NOT_SPIED);
   });
 
   test('logs exactly one readiness line after the listening event (F-004-RQ-001)', async () => {
@@ -318,7 +358,7 @@ describe('bootstrap (L4)', () => {
     expect(response.headers['content-type']).toBe(expected.CONTENT_TYPE);
   });
 
-  test('exposes no API from the loaded module (F-005-RQ-003)', () => {
+  test('exposes no API and depends on nothing but one built-in module (F-005-RQ-001, F-005-RQ-003)', () => {
     // The synchronous variant is enough: the exports object exists as soon as the module has been
     // evaluated, and the teardown path waits for the bind to settle before releasing it.
     loaded = loadServer();
@@ -338,14 +378,11 @@ describe('bootstrap (L4)', () => {
     expect(Object.keys(subjectModule).length).toBe(0);
     expect(subjectModule.server).toBeUndefined();
     expect(subjectModule.handler).toBeUndefined();
-  });
 
-  test('depends on nothing but a single built-in module (F-005-RQ-001)', () => {
-    // Loaded first, and deliberately: reading the file the harness itself resolved is what ties
-    // this structural claim to the module that actually ran, rather than to a path restated here
-    // and hoped to be the same one.
-    loaded = loadServer();
-
+    // THE OTHER HALF OF THE SAME STRUCTURAL CLAIM: what the subject depends on.
+    //
+    // Read from the file the harness itself resolved, which is what ties the claim to the module
+    // that actually ran rather than to a path restated here and hoped to be the same one.
     const source = fs.readFileSync(loaded.subjectPath, 'utf8');
     const specifiers = requireSpecifiers(source);
 
@@ -474,37 +511,5 @@ describe('bootstrap (L4)', () => {
     expect(loaded.errors.length).toBe(1);
     expect(loaded.logs.length).toBe(0);
     expect(loaded.server.listening).toBe(false);
-  });
-
-  test('leaves a spy the test installed untouched when the harness tears down (S-4)', async () => {
-    // A spy that belongs to the TEST: installed before the harness runs and still needed after it
-    // has finished. Nothing about it relates to the subject.
-    const target = {
-      probe() {
-        return NOT_SPIED;
-      }
-    };
-    const targetSpy = jest.spyOn(target, 'probe').mockReturnValue(OWNED_BY_TEST);
-
-    loaded = await loadServerReady();
-
-    // Torn down explicitly, MID-TEST, which is precisely the situation the harness's ownership
-    // contract has to survive: a blanket restore-all inside its teardown would uninstall the spy
-    // above before this case could use it again. The unconditional teardown in `afterEach` is
-    // idempotent, so calling it here costs nothing later.
-    await loaded.teardown();
-
-    // The harness DID restore what it owns - its console spy is gone. The runner's own automatic
-    // restoration cannot account for this, because that is applied in a top-level `beforeEach`,
-    // i.e. at the start of the NEXT test, not at the end of this one.
-    expect(jest.isMockFunction(console.log)).toBe(false);
-
-    // ...and it left the test's own spy exactly as it found it.
-    expect(jest.isMockFunction(target.probe)).toBe(true);
-    expect(target.probe()).toBe(OWNED_BY_TEST);
-
-    // Restored by its owner, which is the whole point of the contract.
-    targetSpy.mockRestore();
-    expect(target.probe()).toBe(NOT_SPIED);
   });
 });

@@ -9,15 +9,19 @@
  * does (contract D2): no child process and no timer is created anywhere in this file, and the
  * subject itself never opens a socket here.
  *
- * ONE DELIBERATE EXCEPTION, AND IT IS THE POINT OF THE EXERCISE. The case that asserts the
- * recorded endpoint also binds a short-lived PROBE listener on that endpoint itself, because
- * reading back values the fake recorded cannot, on its own, show that nothing was bound - a fake
- * that accidentally opened the real listener would satisfy exactly the same two assertions
- * whenever the port happened to be free. The probe is created with `net.createServer`, which sits
- * OUTSIDE the `http.createServer` stub, so the bind cannot be answered by the fake; it succeeds
- * only if the subject genuinely left the address alone. It is closed on an unconditional path.
- * This gives the tier the same fixed-port precondition the suite already documents: TCP
- * 127.0.0.1:3000 must be free before the run.
+ * NO EXCEPTIONS: THIS TIER BINDS NOTHING. Not the fixed port, not an ephemeral one - no socket at
+ * all, of any kind, for any reason. `test/unit` therefore has NO port precondition and can run
+ * while another process holds 127.0.0.1:3000. The fixed address is bound in exactly one place in
+ * the whole suite, the L4 bootstrap tier, whose first case reads it back from `address()` on the
+ * real server; concentrating every kernel bind there is what keeps the tiers isolated, and a
+ * second binder here would quietly re-introduce the contention that isolation exists to prevent.
+ *
+ * That leaves the claim "and it bound nothing" to be proven WITHOUT a socket, which the endpoint
+ * case below does structurally: the object the subject called `listen` on is inspected directly
+ * and shown to be a plain recorder - three own properties, `Object.prototype` for a prototype,
+ * and none of the `address`/`close`/`listening` surface a bound server would carry. An object of
+ * that shape cannot have reached the kernel, so the recorded values describe an address that was
+ * asked for and never claimed.
  *
  * `server.js` is REFERENCE ONLY - never modified, never loaded from here. The harness loads it on
  * our behalf by an absolute path resolved from the runner root, so nothing in this file depends
@@ -35,7 +39,6 @@
  * requirement identifier it exercises so the traceability map is checkable from titles alone.
  */
 
-const net = require('net');
 const { captureHandler, captureHandlerReady } = require('../helpers/captureHandler');
 const EXPECTED = require('../fixtures/expected');
 
@@ -210,71 +213,39 @@ describe('module bootstrap and readiness log', () => {
     expect(captured.createServerCalls).toBe(1);
   });
 
-  test('records the intended port and host without binding a socket (F-002-RQ-001)', async () => {
+  test('records the intended port and host without binding a socket (F-002-RQ-001)', () => {
     captured = captureHandler();
 
     // Argument order mirrors the subject's own call - PORT FIRST, host second. Reading them the
     // other way round would still pass a sloppy assertion while proving nothing.
-    //
-    // No socket exists at this point: the fake's `listen` records what it was handed and returns,
-    // which is what lets this tier assert the intended endpoint and still leave the fixed port
-    // free.
     expect(captured.recordedPort).toBe(EXPECTED.PORT);
     expect(captured.recordedHost).toBe(EXPECTED.HOST);
 
-    // INDEPENDENT PROOF THAT THE ENDPOINT REALLY IS FREE.
+    // THE SECOND HALF OF THE TITLE, PROVEN WITHOUT OPENING A SOCKET.
     //
     // The two assertions above read back values the fake recorded, which shows what the subject
-    // ASKED for and nothing about what the operating system did with it: a fake that accidentally
-    // opened the real listener would satisfy both of them unchanged whenever the port happened to
-    // be free. The claim in this case's title is therefore checked against the address itself.
+    // ASKED for and nothing about what became of the request. That gap is closed by inspecting
+    // the object the subject actually called `listen` on. It is a plain recorder: an object
+    // literal whose prototype is `Object.prototype` and whose own properties are exactly the two
+    // recording slots and the recording method - no `address()`, no `close()`, no `listening`
+    // flag, none of the surface a server that had reached the kernel would carry.
     //
-    // `net.createServer` is chosen deliberately over `http.createServer`: the latter is currently
-    // the stub, so a probe built with it would be answered by the fake and prove nothing, and it
-    // would also displace the subject's own call from the spy's index 0. The probe below reaches
-    // the real kernel bind, so it can only succeed while the stub is installed if the subject
-    // genuinely left 127.0.0.1:3000 alone. Binding it is the assertion; EADDRINUSE would fail
-    // this case, as it should.
-    const probe = net.createServer();
+    // An object of that shape has no socket to close and no address to report, so the endpoint
+    // named above was asked for and never claimed. The complementary evidence - that the address
+    // is genuinely reachable once something DOES bind it - belongs to the L4 bootstrap tier,
+    // which loads the subject for real and reads 127.0.0.1:3000 back from `address()`. Binding
+    // the fixed port from here would duplicate that proof and hand this tier a precondition the
+    // suite deliberately confines to one file.
+    expect(Object.getPrototypeOf(captured.fake)).toBe(Object.prototype);
+    expect(Object.keys(captured.fake)).toEqual(['_port', '_host', 'listen']);
+    expect(captured.fake.address).toBeUndefined();
+    expect(captured.fake.close).toBeUndefined();
+    expect(captured.fake.listening).toBeUndefined();
 
-    try {
-      const probeAddress = await new Promise((resolve, reject) => {
-        // A single settle path in both directions, each detaching the other listener by
-        // reference, so neither outlives the bind attempt.
-        const onProbeListening = () => {
-          probe.removeListener('error', onProbeError);
-          resolve(probe.address());
-        };
-
-        const onProbeError = (probeError) => {
-          probe.removeListener('listening', onProbeListening);
-          reject(probeError);
-        };
-
-        probe.once('listening', onProbeListening);
-        probe.once('error', onProbeError);
-        probe.listen(EXPECTED.PORT, EXPECTED.HOST);
-      });
-
-      // Exact endpoint, not merely "a bind happened": the probe must have claimed the very
-      // address the subject named, so the two recorded values above are shown to describe an
-      // address that was still available.
-      expect(probeAddress).toEqual({
-        address: EXPECTED.HOST,
-        family: 'IPv4',
-        port: EXPECTED.PORT
-      });
-    } finally {
-      // Unconditional release, on the failing path as much as the passing one: a probe left open
-      // would hold the fixed port for the rest of the run and leak a handle. When the bind never
-      // succeeded, `close()` still invokes its callback - with ERR_SERVER_NOT_RUNNING, which is
-      // precisely the state being cleaned up after - so the argument is deliberately ignored.
-      await new Promise((resolve) => {
-        probe.close(() => {
-          resolve();
-        });
-      });
-    }
+    // The recorded values are the fake's own slots rather than a copy that drifted from them, so
+    // the two assertions at the top of this case describe the very arguments `listen` received.
+    expect(captured.fake._port).toBe(captured.recordedPort);
+    expect(captured.fake._host).toBe(captured.recordedHost);
   });
 
   test('composes the readiness line from the same host and port it binds (F-002-RQ-003)', async () => {

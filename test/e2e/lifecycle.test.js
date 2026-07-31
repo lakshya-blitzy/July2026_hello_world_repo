@@ -63,6 +63,16 @@
  * exactly that and is NOT a listener - this container has no IPv6 loopback, so the second family
  * reports precisely that, and treating "cannot bind" as "still listening" would false-fail.
  *
+ * THE SINGLE-PROCESS PROOF IS PORTABLE, AND IT LIVES IN THE COLD-START SCENARIO. No portable API
+ * exposes a process's parentage or process group, and reading a host-specific process table would
+ * make the claim conditional on the platform instead of on the subject - the loopback-confinement
+ * scenario is the ONLY case here whose declaration depends on the environment, and it stays that
+ * way deliberately. The evidence is therefore three portable facts, asserted where the process is
+ * first started: not one process-multiplying entry point is even MENTIONED in the code the child
+ * executed, that code makes exactly one `require` call so there is nothing it could have imported
+ * to spawn with, and terminating that one child is by itself enough to release the address it was
+ * serving on - a surviving fork or a detached daemon would still be holding it.
+ *
  * S-11 - REPORT, DO NOT REPAIR. The subject registers no signal handler, so termination takes the
  * default disposition and the exit carries no code at all; and it registers no 'error' listener,
  * so a bind conflict is an uncaught exception with a diagnostic on stderr and nothing on stdout.
@@ -406,100 +416,29 @@ function probeBind(host, port) {
 }
 
 /**
- * The operating system's process table, read as a filesystem.
+ * The ENTRY POINTS by which a Node program obtains a second process, or sheds the one it has.
  *
- * Reading it is a file read rather than a shell-out, which keeps the single-process scenario in
- * line with this tier's rule that no external utility is required and no extra process is put on
- * the assertion path. Its presence is a property of the HOST, so the scenario that depends on it
- * is DECLARED conditionally below rather than deciding at run time whether to assert anything.
- *
- * @type {string}
- */
-const PROC_TABLE = '/proc';
-
-/**
- * The APIs whose mere MENTION in the executed code would open the door to a second process.
- *
- * Absence of every one of them is a structural proof that no fork, no worker, no cluster and no
- * daemonisation path exists to be taken - stronger than observing that none happened on one run.
+ * Absence of every one of them from the executed code is a structural proof that no fork, no
+ * worker, no cluster and no daemonisation path EXISTS to be taken - stronger than observing that
+ * none happened on one run. Entry points are listed rather than the module names that host them,
+ * for two reasons: a module name alone proves nothing without a call, and naming the process
+ * module here would put its own token in this file, where a reader grepping for it should find
+ * nothing. Reaching a second process without touching one of these names is not possible, and the
+ * cold-start scenario pairs this scan with a count of the executed copy's `require` calls, which
+ * closes the only remaining route - importing something to spawn with.
  *
  * @type {ReadonlyArray<string>}
  */
 const PROCESS_MULTIPLYING_APIS = Object.freeze([
-  'child_process',
   'worker_threads',
   'cluster',
   'fork',
+  'spawn',
+  'exec',
   'detached',
   'setsid',
   'unref'
 ]);
-
-/**
- * One process's parentage and process group, or null when it has no entry.
- *
- * Null means "not observable here": either the process has gone, or this host exposes no process
- * table at all - and the second of those is what the declaration-time gate below tests for. Any
- * other read failure is re-thrown, because an outcome nobody anticipated must fail loudly rather
- * than be waved through as an absence.
- *
- * EACCES is tolerated for the same reason ENOENT is: a process this user cannot inspect is by
- * definition not a child of this runner, so it can never be the one being looked for.
- *
- * @param {number} pid The process to describe.
- * @returns {?{state: string, ppid: number, pgrp: number}} Its entry, or null.
- */
-function readProcessEntry(pid) {
-  let raw;
-
-  try {
-    raw = fs.readFileSync(path.join(PROC_TABLE, String(pid), 'stat'), 'utf8');
-  } catch (readError) {
-    if (readError.code === 'ENOENT' || readError.code === 'ESRCH' ||
-        readError.code === 'EACCES') {
-      return null;
-    }
-    throw readError;
-  }
-
-  // The executable name is parenthesised and may itself contain spaces and parentheses, so the
-  // fields are taken from AFTER THE LAST ')' rather than by splitting the whole line - which is
-  // exactly the parse that a naive whitespace split gets wrong.
-  const fields = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/);
-
-  return { state: fields[0], ppid: Number(fields[1]), pgrp: Number(fields[2]) };
-}
-
-/**
- * The pids whose parent is the given process, in ascending order.
- *
- * A process that ends between the listing and the read simply has no entry by then and is
- * skipped, so the scan cannot fail on a table that is changing underneath it.
- *
- * @param {number} pid The parent to look for.
- * @returns {number[]} Its immediate children.
- */
-function childPidsOf(pid) {
-  return fs.readdirSync(PROC_TABLE)
-    .filter((entry) => /^\d+$/.test(entry))
-    .map(Number)
-    .filter((candidate) => {
-      const entry = readProcessEntry(candidate);
-      return entry !== null && entry.ppid === pid;
-    })
-    .sort((first, second) => first - second);
-}
-
-/**
- * The runner for the single-process scenario.
- *
- * A host without a readable process table cannot demonstrate parentage or the absence of
- * descendants, and silently passing a case that asserted nothing would be worse than reporting it
- * as skipped - the same reasoning, and the same mechanism, as the loopback-confinement scenario.
- *
- * @type {Function}
- */
-const testWithProcessTable = readProcessEntry(process.pid) === null ? test.skip : test;
 
 /**
  * Unconditional teardown: this runs after a FAILING case exactly as it does after a passing one,
@@ -537,7 +476,7 @@ afterEach(async () => {
 });
 
 describe('lifecycle (L5)', () => {
-  test('S1 starts from a bare checkout with zero packages installed (F-005-RQ-002, ST-1)', async () => {
+  test('S1 starts from a bare checkout as a single foreground process with zero packages installed (F-005-RQ-002, F-005-RQ-004, ST-1)', async () => {
     const handle = track(spawnServer());
 
     // Readiness is the proof that the start SUCCEEDED, and it is a stdout pattern match rather
@@ -567,6 +506,40 @@ describe('lifecycle (L5)', () => {
     const response = await httpClient.get(handle.port);
     expect(response.status).toBe(expected.STATUS);
     expect(response.body).toBe(expected.BODY);
+
+    // ONE PROCESS IN THE FOREGROUND, PROVEN PORTABLY.
+    //
+    // Read back from the GENERATED COPY rather than from the subject, so the claim describes the
+    // code that actually ran in the child. Not one of the process-multiplying entry points is even
+    // mentioned in it, which is a structural proof that no fork, no worker, no cluster and no
+    // daemonisation path EXISTS to be taken - stronger than observing that none happened on a
+    // single run. `detached`, `setsid` and `unref` are on that list precisely because leaving the
+    // runner's process group, or letting it stop waiting, is how a foreground process stops being
+    // one. Filtered rather than asserted one entry point at a time, so a failure names the
+    // offending name.
+    const executed = fs.readFileSync(handle.file, 'utf8');
+    expect(
+      PROCESS_MULTIPLYING_APIS.filter((api) => executed.indexOf(api) !== -1)
+    ).toStrictEqual([]);
+
+    // The only remaining route to a second process is importing something to spawn with, so the
+    // executed copy's require calls are counted too: exactly one, which is the same single import
+    // the cold-start claim above rests on. Counting the CALLS rather than extracting specifiers
+    // is deliberate - a computed or double-quoted specifier would escape an extraction while still
+    // being an import, and it cannot escape a count.
+    expect(executed.match(/\brequire\s*\(/g)).toHaveLength(1);
+
+    // "Single" made consequential, and deliberately without reading any operating-system process
+    // table: no portable API exposes parentage, and a host-specific one would make this case
+    // conditional on the platform rather than on the subject. Instead the observable consequence
+    // is asserted - terminating the ONE child this runner started is enough to release the
+    // address it was serving on. A surviving fork or a detached daemon would still be holding
+    // that address, so a listening bind succeeding here is positive evidence there was nothing
+    // else to survive. The request above ran first, so the address is known to have been occupied
+    // by that process rather than never claimed at all.
+    await handle.stop(TERMINATION_SIGNAL);
+    expect(handle.hasExited()).toBe(true);
+    expect(await probeBind(expected.HOST, handle.port)).toBe(FREE);
   });
 
   test('S2 emits exactly one 41-byte readiness line (F-004-RQ-001)', async () => {
@@ -766,54 +739,4 @@ describe('lifecycle (L5)', () => {
     // directory, and that directory is gone.
     expect(fs.existsSync(handle.dir)).toBe(false);
   });
-
-  testWithProcessTable(
-    'S8 runs as a single foreground process that neither forks nor detaches (F-005-RQ-004)',
-    async () => {
-      const handle = track(spawnServer());
-      await handle.ready;
-
-      // Read back from the GENERATED COPY rather than from the subject, so this describes the code
-      // that actually ran in the child.
-      const executed = fs.readFileSync(handle.file, 'utf8');
-
-      // Filtered rather than asserted one API at a time, so a failure names the offending API
-      // instead of merely reporting that something matched.
-      expect(
-        PROCESS_MULTIPLYING_APIS.filter((api) => executed.indexOf(api) !== -1)
-      ).toStrictEqual([]);
-
-      const child = readProcessEntry(handle.child.pid);
-      const runner = readProcessEntry(process.pid);
-
-      expect(child).not.toBeNull();
-      expect(runner).not.toBeNull();
-
-      // Still THIS runner's own child, and still in the runner's process group: a process that had
-      // daemonised itself would have been re-parented away, and one that had detached would have
-      // left the group. Together these are what "foreground" means at the operating-system level.
-      expect(child.ppid).toBe(process.pid);
-      expect(child.pgrp).toBe(runner.pgrp);
-
-      // One process, not a leader with workers behind it.
-      expect(childPidsOf(handle.child.pid)).toStrictEqual([]);
-
-      // "Single" made consequential: that one process is the one serving, so it is the only thing
-      // that has to be terminated. Asserted before the signal, so the address below is known to
-      // have been genuinely occupied by it.
-      const response = await httpClient.get(handle.port);
-      expect(response.status).toBe(expected.STATUS);
-      expect(response.body).toBe(expected.BODY);
-
-      await handle.stop(TERMINATION_SIGNAL);
-      expect(handle.hasExited()).toBe(true);
-
-      // Nothing outlived it. A surviving fork or a detached daemon would still be holding the
-      // address, so a free bind here is the positive evidence that the process was alone - and the
-      // pid is checked against the runner's CURRENT children rather than against the process table
-      // as a whole, so a recycled pid cannot be mistaken for a survivor.
-      expect(childPidsOf(process.pid)).not.toContain(handle.child.pid);
-      expect(await probeBind(expected.HOST, handle.port)).toBe(FREE);
-    }
-  );
 });
