@@ -306,9 +306,9 @@ describe('runtime-produced semantics', () => {
     // assertion.
     const bodyBytes = res.text === undefined ? 0 : Buffer.byteLength(res.text);
     expect(bodyBytes).toBe(0);
-    // And the framing header goes with the body, so a HEAD response carries four header keys
-    // rather than the five a GET carries. Implied by the key set above and stated explicitly
-    // because it is the framing property F-003-RQ-005 turns on.
+    // And the framing header goes with the body, so this keep-alive HEAD response carries four
+    // header keys rather than the five the same keep-alive GET carries. Implied by the key set
+    // above and stated explicitly because it is the framing property F-003-RQ-005 turns on.
     expect(res.headers[FRAMING_HEADER]).toBeUndefined();
   });
 

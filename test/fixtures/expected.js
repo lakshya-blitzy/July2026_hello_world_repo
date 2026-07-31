@@ -17,9 +17,11 @@ module.exports = Object.freeze({
   // that an added header fails the test. These five keys materialise only on a
   // keep-alive connection: a client sending `Connection: close` sees four keys
   // and no keep-alive header at all, so asking for keep-alive is the consumer's
-  // responsibility. A HEAD response also carries four keys - the runtime omits
-  // content-length along with the body - so a HEAD case asserts a zero-byte
-  // body instead of reusing this set.
+  // responsibility. The method drops a key too, independently: the runtime omits
+  // content-length from a HEAD response along with the body, so a keep-alive HEAD
+  // carries four keys and a close-disposition HEAD three. A HEAD case therefore
+  // derives its own set from this one rather than reusing it, and pairs that with
+  // a zero-byte-body assertion.
   HEADER_KEYS: Object.freeze([
     'connection',
     'content-length',

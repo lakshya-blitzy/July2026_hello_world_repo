@@ -16,9 +16,9 @@ CI=true npm test                               # 5 suites, 61 tests, 100% covera
 
 | Purpose | Command | Verified outcome |
 | --- | --- | --- |
-| First-time install, from no manifest at all | `npm install --save-dev --save-exact --ignore-scripts --no-fund --no-audit jest@30.4.2 supertest@7.2.2` | `added 334 packages`; pins both at exact versions and generates a `lockfileVersion 3` lockfile. This is the **pre-`overrides`** figure — it also reports 19 advisories and one `glob@10.5.0` deprecation notice, both of which the `overrides` block below then clears |
-| Install against the committed manifest | `npm install --ignore-scripts --no-fund --no-audit` | `added 297 packages`; resolves the `overrides` block, 325 lockfile entries, no deprecation notice |
-| Clean install (reproducible / pipelines) | `npm ci --ignore-scripts --no-fund --no-audit` | `added 297 packages in 1s` |
+| First-time install, from no manifest at all | `npm install --save-dev --save-exact --ignore-scripts --no-fund --no-audit jest@30.4.2 supertest@7.2.2` | `added 334 packages`; pins both at exact versions and generates a `lockfileVersion 3` lockfile. This is the **pre-`overrides`** figure — it also reports 19 advisories, all of which the `overrides` pin below clears |
+| Install against the committed manifest | `npm install --ignore-scripts --no-fund --no-audit` | `added 332 packages`; resolves the `overrides` pin, 361 lockfile entries |
+| Clean install (reproducible / pipelines) | `npm ci --ignore-scripts --no-fund --no-audit` | `added 332 packages in 1s` |
 | Run the suite | `CI=true npm test` → `jest` | exit 0; 5 suites, 61 tests passed; 100% on all four coverage metrics |
 | Pipeline run | `CI=true npm run test:ci` → `jest --ci --runInBand --detectOpenHandles` | exit 0; **no open-handle warning** |
 | Coverage | `npm run test:coverage` → `jest --coverage` | 100% statements / branches / functions / lines |
@@ -26,7 +26,7 @@ CI=true npm test                               # 5 suites, 61 tests, 100% covera
 | Single file | `npx jest --ci test/e2e/bootstrap.test.js` | 1 suite, 10 tests passed, 100% coverage |
 | Single file, child-process tier | `npx jest --ci test/e2e/lifecycle.test.js` | 1 suite, 7 tests passed — then see the coverage-gate note below |
 | Single test by name | `npx jest --ci -t "SIGTERM"` | 1 test passed, 60 skipped, 4 suites skipped — same note applies |
-| Brace-glob check (after any dependency change) | `node -e "const m=require('minimatch');console.log(m.minimatch('a.js','*.{js,ts}'))"` | `true` — see the override note below |
+| Brace-free-pattern check (after any config change) | `node -e "const c=require('./jest.config.js');console.log([...c.testMatch,...c.collectCoverageFrom].filter(p=>p.includes('{')).length)"` | `0` — no configured pattern contains a brace, which is the invariant the override note below explains |
 | Debug | `npm run test:debug` → `node --inspect-brk node_modules/.bin/jest --runInBand` | attaches an inspector, breaks before the first test |
 | Syntax gate | `node --check server.js` | exit 0 |
 | Audit (whole tree) | `npm audit` | `found 0 vulnerabilities` |
@@ -36,53 +36,58 @@ CI=true npm test                               # 5 suites, 61 tests, 100% covera
 `npm run test:watch` (→ `jest --watch`) is provided for interactive local development only and **MUST
 NEVER be invoked in an automated or non-interactive context — it does not terminate.**
 
-`-t` takes a **regular expression**, and every test title ends in a parenthesised requirement ID, so
-select either on a substring that omits the suffix — `-t "SIGTERM"` — or on the full title with the
-parentheses escaped: `-t "records the intended port and host without binding a socket \(F-002-RQ-001\)"`.
+`-t` takes a **regular expression**, and every test title ends in a parenthesised identifier — a
+requirement ID for the cases that trace to one, otherwise the standard or scenario ID that applies
+(see *Traceability* below) — so select either on a substring that omits the suffix —
+`-t "SIGTERM"` — or on the full title with the parentheses escaped:
+`-t "records the intended port and host without binding a socket \(F-002-RQ-001\)"`.
 An unescaped `(F-002-RQ-001)` is read as a capture group and silently matches nothing.
 
-`--ignore-scripts` is mandated: two packages in the resolved tree declare an install script —
-`unrs-resolver@1.12.2`, which is installed on every platform, and `fsevents@2.3.3`, which is optional
-and macOS-only and so is not even fetched here. `.npmrc` sets the flag as the project default so
-every install honours it with or without it being passed.
+`--ignore-scripts` is mandated, and it has to be **passed on the command line every time**: this
+repository ships no npm configuration file, so nothing sets the flag for you. Two packages in the
+resolved tree declare an install script — `unrs-resolver@1.12.2`, which is reached through
+`jest-resolve` and installed on every platform, and `fsevents@2.3.3`, which is optional and
+macOS-only and so is not even fetched here. Every install command above carries the flag for that
+reason; `npm ci --ignore-scripts` is the one to copy into a pipeline. The flag does not affect
+`npm run <script>`, `npm test` or `npm start`, so all nine scripts work unchanged, and the native
+binding `unrs-resolver` needs arrives as an ordinary optional dependency from the registry rather
+than being built by the script — which is why Jest resolves normally with scripts disabled.
 
-**Why `overrides` has three entries, and why that is a documented deviation.** `brace-expansion` is
-pinned to `5.0.8` to close advisory GHSA-mh99-v99m-4gvg, a denial of service reached through
-`minimatch` and `glob`/`test-exclude`. The advisory covers every release up to and including `5.0.7`,
-and no earlier line carries a backport, so the pin cannot be relaxed or satisfied on an older branch.
+**`overrides` holds exactly one entry, and what that entry does and does not cover.**
+`brace-expansion` is pinned to `5.0.8` to close advisory GHSA-mh99-v99m-4gvg, a denial of service
+reached through `minimatch` and `glob`/`test-exclude`. The advisory covers every release up to and
+including `5.0.7` and no earlier line carries a backport, so the pin cannot be relaxed or satisfied
+on an older branch. Measured on the shipped graph: a first-time install without the pin reports
+**19 high-severity advisories**, and with it `npm audit` and `npm audit --omit=dev` both report
+`found 0 vulnerabilities` while the suite stays green at 61 passed and 100% coverage. The automated
+remediation npm proposes instead — `jest@25.0.0` — is **rejected**: it regresses the runner by five
+major versions.
 
-That pin alone is not sufficient, and this was measured rather than assumed. `brace-expansion@5.x`
-moved from a callable default export to named exports (`expand`), while the versions the runner
-resolves without help — `minimatch@9.0.9`, which declares `^2.0.2`, and a nested `minimatch@3.1.5`,
-which declares `^1.1.7` — still import the callable form. With `brace-expansion` as the *only*
-entry, the resolved tree audits clean and the suite still passes, yet every pattern containing braces
-throws: `minimatch@9` raises `TypeError: (0 , brace_expansion_1.default) is not a function`, and
-`minimatch@3` and `test-exclude@6` raise `TypeError: expand is not a function`. Nothing in a normal
-run uses a brace pattern, which is exactly why the breakage is silent.
+What the pin does **not** do is modernise the packages that consume `brace-expansion`.
+`brace-expansion@5.x` replaced a callable default export with named exports (`expand`), while the
+versions Jest 30.4.2 resolves — `minimatch@9.0.9` (declares `^2.0.2`), a nested `minimatch@3.1.5`
+(declares `^1.1.7`), `test-exclude@6.0.0` and `glob@10.5.0` — still import the callable form. The
+consequence is narrow but real, and measured rather than assumed: a pattern **containing braces**
+throws (`minimatch@9` and `glob@10.5.0` raise
+`TypeError: (0 , brace_expansion_1.default) is not a function`; `minimatch@3.1.5` and a
+default-options `test-exclude@6.0.0` raise `TypeError: expand is not a function`), while every
+brace-free pattern works normally.
 
-The two remaining entries therefore pin the *consumers that carry the old `minimatch`* to versions
-that declare `brace-expansion ^5` natively: `test-exclude@8.0.0` and `glob@13.0.6`. **`minimatch`
-needs no entry of its own** — once those two are pinned it is the only package in the tree that
-declares it, both pinned versions declare `^10.2.2`, and it resolves natively to `10.2.6`, which
-declares `brace-expansion ^5.0.8`. Removing a forced version is strictly better than keeping one, so
-the block holds three entries rather than four.
+Nothing this project runs is affected, and that is a property to check rather than assume:
+`jest.config.js` declares exactly two pattern strings — `testMatch` and `collectCoverageFrom` — and
+neither contains a brace (the check is in the table above), while the coverage path is safe because
+`@jest/transform` invokes `babel-plugin-istanbul` with `exclude: []` and `extension: false`, so
+`test-exclude` never evaluates the brace-bearing default exclude list that would otherwise throw.
+Keep both properties true: if a future pattern needs a brace, expand it into separate brace-free
+patterns rather than reaching for another `overrides` entry.
 
-Measured on the shipped graph: brace patterns expand correctly through `minimatch`, `test-exclude`
-and `glob.sync`; `npm audit` and `npm audit --omit=dev` both report `found 0 vulnerabilities`; the
-deprecated `glob@10`/`glob@7` generations are gone, so a clean install prints no deprecation notice;
-and the tree is **35 packages and 35 lockfile entries smaller** than the single-entry alternative
-(297 installed / 325 entries against 332 / 360). Run the brace-glob check in the table above after
-changing any dependency — a brace pattern is the one thing a normal run never exercises.
-
-**Deviation, stated plainly.** The project plan authorises a single `overrides` entry,
-`brace-expansion@5.0.8`, and records that entry as sufficient. The two consumer pins are therefore a
-**deliberate, measured deviation from that plan, not an implementation of it**, and this graph should
-not be read as matching the plan's one-entry dependency design. It is documented here rather than
-presented as compliant because the one-entry design was reproduced and found to leave brace
-expansion broken across three packages, and because the alternative remediation npm proposes —
-`jest@25.0.0` — regresses the runner by five major versions. Reverting to a single entry would
-restore plan fidelity at the cost of a silently broken glob implementation; that trade-off is a
-decision for whoever owns the plan, and the evidence for making it is the measurement above.
+Two consequences of staying on this graph are recorded here so neither looks like an oversight.
+`npm ci` prints deprecation notices for `inflight@1.0.6`, `glob@7.2.3` and `glob@10.5.0`; they are
+upstream lineage, they carry **no** open advisory in this tree (`npm audit` is clean), and they are
+deliberately **not** papered over by forcing newer `glob`/`test-exclude` majors into consumers that
+declare older ranges — that is a second unverified override, not a fix. The real remedy is an
+upstream Jest/Istanbul generation whose `minimatch` declares `brace-expansion ^5` natively, which is
+a dependency upgrade for whoever owns the plan, not a local pin.
 
 **Coverage-gate note.** Coverage is collected on every run and gated at 100%, so a selection that
 never loads `server.js` in-process passes its cases and *then* exits non-zero on the gate. That is
@@ -218,10 +223,25 @@ once, and every tier follows.
 | `MALFORMED_RESPONSE` | `HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n` | runtime parser, measured |
 | `OVERSIZED_RESPONSE` | `HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n` | runtime parser, measured |
 
-The five-key set is what a **keep-alive** `GET` receives; a client sending `Connection: close`, and any
-`HEAD`, is answered with four keys, so asking for persistence is the consumer's responsibility. The
-`400` and `431` outcomes are ordinary responses produced by the Node HTTP parser beneath the handler —
-they are asserted on their response bytes and are never treated as thrown or rejected operations.
+The five-key set is what a **keep-alive `GET`** receives, so asking for persistence is the
+consumer's responsibility, and the method and disposition each drop one key. Measured on the wire,
+all four combinations:
+
+| Request | Keys | Set |
+| --- | --- | --- |
+| `GET`, `Connection: keep-alive` | 5 | `connection`, `content-length`, `content-type`, `date`, `keep-alive` |
+| `GET`, `Connection: close` | 4 | `connection`, `content-length`, `content-type`, `date` |
+| `HEAD`, `Connection: keep-alive` | 4 | `connection`, `content-type`, `date`, `keep-alive` |
+| `HEAD`, `Connection: close` | 3 | `connection`, `content-type`, `date` |
+
+`content-length` goes with the body the runtime suppresses for a `HEAD`, and `keep-alive` exists
+only while the connection does. `HEADER_KEYS` above is therefore asserted against keep-alive `GET`
+requests, and the `HEAD` cases assert that same set minus `content-length` — derived from the
+fixture rather than restated, so a change to either half fails a test instead of quietly
+disagreeing. The close-disposition `HEAD` case asserts the zero-body property on the bytes rather
+than the key set, because the connection ends and the whole response is in hand. The `400` and `431`
+outcomes are ordinary responses produced by the Node HTTP parser beneath the handler — they are
+asserted on their response bytes and are never treated as thrown or rejected operations.
 
 ### Coverage and reporters
 
@@ -244,23 +264,19 @@ they are asserted on their response bytes and are never treated as thrown or rej
 ### Provenance
 
 Measured rather than estimated, on **Node.js 24.18.1 / npm 11.18.0**: 61 tests across 5 suites in
-0.695 s of runner time (1.245 s under `test:ci`); 13 / 31 / 17 tests in the unit, integration and
-e2e subsets; **297 installed packages from 325 lockfile entries** (`lockfileVersion 3`, every entry
+0.705 s of runner time (1.194 s under `test:ci`); 13 / 31 / 17 tests in the unit, integration and
+e2e subsets; **332 installed packages from 361 lockfile entries** (`lockfileVersion 3`, every entry
 carrying a `resolved` URL and an `integrity` digest); 0 audit findings on the whole tree and on the
 production tree, with `npm ls --omit=dev --all` reporting an empty tree; 100% on all four coverage
 metrics (9/9, 0/0, 2/2, 9/9); the 14-byte body with digest `c98c24b6…ad31`; and the 41-byte readiness
 line. The installed `jest` package is 30.4.2 while its CLI self-reports 30.4.1, because the
 constituent packages version independently.
 
-**Two divergences from the project plan are disclosed rather than presented as compliance.** First,
-the `overrides` block carries three entries where the plan authorises one; the measurement behind that
-choice, and the fact that it is a deviation, are set out in full under *Why `overrides` has three
-entries* above. Second, **`.npmrc` is not one of the artefacts the plan's transformation map
-enumerates.** It exists because the plan separately *mandates* `--ignore-scripts` at install time, and
-a flag documented only in prose is not a control — a plain `npm install` or `npm ci` would still
-execute lifecycle code. It adds no dependency, no script and no build step, and re-locking with the
-file removed was measured to produce a byte-identical `package-lock.json`, so it changes only whether
-lifecycle code runs, never what is resolved. The file's own header carries this same note.
+The delivery is exactly the seventeen artefacts the project plan enumerates — no extra file, and one
+`overrides` entry rather than a fork of the plan's dependency design. The one property the plan's
+graph does not give you is brace-pattern support in the older `minimatch`/`glob` generation Jest
+30.4.2 resolves; that is measured, bounded and explained under *`overrides` holds exactly one entry*
+above rather than worked around locally.
 
 `server.js` was **not modified** by this work — its SHA-256 remains
 `332fc2d04eb5b8f3cb230855457af80d0dfc246f958d6e49615610d656acc2e0`, byte-identical to the committed
@@ -271,8 +287,19 @@ Because `server.js` contains no conditionals, branch coverage is trivially 100% 
 coverage saturates as soon as the module is loaded once. **Full coverage on this file is therefore
 best understood as a suite-liveness alarm, not as evidence of behavioural thoroughness.** The
 substantive measure is requirement coverage, which moves from **0 of 20 to 20 of 20** catalogued
-requirement identifiers — which is why every test title carries its requirement ID in the form
-`<behaviour in present tense> (<F-ID>)`.
+requirement identifiers.
+
+**Traceability.** Every test title ends in the identifier of the thing it proves, in the form
+`<behaviour in present tense> (<ID>)`, so the mapping is checkable from the titles alone. The ID is
+a requirement ID (`F-002-RQ-001`) wherever the behaviour is one of the 20 catalogued requirements,
+and otherwise the applicable **supplemental-standard** ID, because exactly five cases assert runtime
+or security properties that no `F-` requirement covers: version-header non-disclosure
+(`contract.test.js` — `ST-3`); the parser's `400` and `431` rejections (`protocol.test.js` — `ST-6`,
+twice); and unthrottled concurrent service together with event-driven exchange settling
+(`protocol.test.js` — `ST-7`, twice). Several further titles carry both kinds at once
+(`… (F-001-RQ-002, ST-4)`), and the lifecycle tier additionally **prefixes** its scenario ID
+(`S1`…`S7`) so a child-process scenario is identifiable by number as well as by requirement. No
+title carries an invented ID, and none is left unlabelled.
 
 The suite deliberately documents rather than fixes the server's robustness gaps: there is no `'error'`
 listener, so a bind conflict surfaces as an uncaught exception and a non-zero exit with an
