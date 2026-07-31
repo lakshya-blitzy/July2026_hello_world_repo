@@ -16,8 +16,9 @@ CI=true npm test                               # 5 suites, 61 tests, 100% covera
 
 | Purpose | Command | Verified outcome |
 | --- | --- | --- |
-| First-time install | `npm install --save-dev --save-exact --ignore-scripts --no-fund --no-audit jest@30.4.2 supertest@7.2.2` | `added 297 packages`; pins both at exact versions and generates a `lockfileVersion 3` lockfile |
-| Clean install (reproducible / pipelines) | `npm ci --ignore-scripts --no-fund --no-audit` | `added 303 packages in 1s` |
+| First-time install, from no manifest at all | `npm install --save-dev --save-exact --ignore-scripts --no-fund --no-audit jest@30.4.2 supertest@7.2.2` | `added 334 packages`; pins both at exact versions and generates a `lockfileVersion 3` lockfile. This is the **pre-`overrides`** figure — it also reports 19 advisories and one `glob@10.5.0` deprecation notice, both of which the `overrides` block below then clears |
+| Install against the committed manifest | `npm install --ignore-scripts --no-fund --no-audit` | `added 297 packages`; resolves the `overrides` block, 325 lockfile entries, no deprecation notice |
+| Clean install (reproducible / pipelines) | `npm ci --ignore-scripts --no-fund --no-audit` | `added 297 packages in 1s` |
 | Run the suite | `CI=true npm test` → `jest` | exit 0; 5 suites, 61 tests passed; 100% on all four coverage metrics |
 | Pipeline run | `CI=true npm run test:ci` → `jest --ci --runInBand --detectOpenHandles` | exit 0; **no open-handle warning** |
 | Coverage | `npm run test:coverage` → `jest --coverage` | 100% statements / branches / functions / lines |
@@ -45,20 +46,43 @@ An unescaped `(F-002-RQ-001)` is read as a capture group and silently matches no
 and macOS-only and so is not even fetched here. `.npmrc` sets the flag as the project default so
 every install honours it with or without it being passed.
 
-**Why `overrides` has four entries.** `brace-expansion` is pinned to `5.0.8` to close advisory
-GHSA-mh99-v99m-4gvg, a denial of service reached through `minimatch` and `glob`/`test-exclude`. That
-advisory covers every release up to and including `5.0.7`, so no earlier line is patched and the pin
-cannot be relaxed. But `5.x` moved from a callable default export to named exports, and the versions
-of `minimatch` the runner resolves by default still import the callable form — so pinning that one
-package alone leaves `minimatch`, `glob` and `test-exclude` throwing
-`TypeError: (0 , brace_expansion_1.default) is not a function` on any pattern containing braces. The
-remaining three entries therefore pin the *consumers* to versions that declare `brace-expansion ^5`
-natively: `minimatch@10.2.6`, `test-exclude@8.0.0`, `glob@13.0.6`. Verified afterwards: brace
-patterns expand correctly through all three, `npm audit` and `npm audit --omit=dev` both report
-`found 0 vulnerabilities`, the deprecated `glob@10`/`glob@7` generations are gone (a clean install
-now prints no deprecation notice), and the tree is 29 packages smaller. Run the brace-glob check in
-the table above after changing any dependency — a brace pattern is the one thing a normal run never
-exercises.
+**Why `overrides` has three entries, and why that is a documented deviation.** `brace-expansion` is
+pinned to `5.0.8` to close advisory GHSA-mh99-v99m-4gvg, a denial of service reached through
+`minimatch` and `glob`/`test-exclude`. The advisory covers every release up to and including `5.0.7`,
+and no earlier line carries a backport, so the pin cannot be relaxed or satisfied on an older branch.
+
+That pin alone is not sufficient, and this was measured rather than assumed. `brace-expansion@5.x`
+moved from a callable default export to named exports (`expand`), while the versions the runner
+resolves without help — `minimatch@9.0.9`, which declares `^2.0.2`, and a nested `minimatch@3.1.5`,
+which declares `^1.1.7` — still import the callable form. With `brace-expansion` as the *only*
+entry, the resolved tree audits clean and the suite still passes, yet every pattern containing braces
+throws: `minimatch@9` raises `TypeError: (0 , brace_expansion_1.default) is not a function`, and
+`minimatch@3` and `test-exclude@6` raise `TypeError: expand is not a function`. Nothing in a normal
+run uses a brace pattern, which is exactly why the breakage is silent.
+
+The two remaining entries therefore pin the *consumers that carry the old `minimatch`* to versions
+that declare `brace-expansion ^5` natively: `test-exclude@8.0.0` and `glob@13.0.6`. **`minimatch`
+needs no entry of its own** — once those two are pinned it is the only package in the tree that
+declares it, both pinned versions declare `^10.2.2`, and it resolves natively to `10.2.6`, which
+declares `brace-expansion ^5.0.8`. Removing a forced version is strictly better than keeping one, so
+the block holds three entries rather than four.
+
+Measured on the shipped graph: brace patterns expand correctly through `minimatch`, `test-exclude`
+and `glob.sync`; `npm audit` and `npm audit --omit=dev` both report `found 0 vulnerabilities`; the
+deprecated `glob@10`/`glob@7` generations are gone, so a clean install prints no deprecation notice;
+and the tree is **35 packages and 35 lockfile entries smaller** than the single-entry alternative
+(297 installed / 325 entries against 332 / 360). Run the brace-glob check in the table above after
+changing any dependency — a brace pattern is the one thing a normal run never exercises.
+
+**Deviation, stated plainly.** The project plan authorises a single `overrides` entry,
+`brace-expansion@5.0.8`, and records that entry as sufficient. The two consumer pins are therefore a
+**deliberate, measured deviation from that plan, not an implementation of it**, and this graph should
+not be read as matching the plan's one-entry dependency design. It is documented here rather than
+presented as compliant because the one-entry design was reproduced and found to leave brace
+expansion broken across three packages, and because the alternative remediation npm proposes —
+`jest@25.0.0` — regresses the runner by five major versions. Reverting to a single entry would
+restore plan fidelity at the cost of a silently broken glob implementation; that trade-off is a
+decision for whoever owns the plan, and the evidence for making it is the measurement above.
 
 **Coverage-gate note.** Coverage is collected on every run and gated at 100%, so a selection that
 never loads `server.js` in-process passes its cases and *then* exits non-zero on the gate. That is
@@ -89,7 +113,7 @@ test/
 ├── integration/contract.test.js      L2 — wire-level response contract (ephemeral port)
 ├── integration/protocol.test.js      L3 — raw-socket parser/framing behaviour (ephemeral port)
 ├── e2e/bootstrap.test.js             L4 — real require-time bind + shutdown (ONLY binder of 127.0.0.1:3000)
-├── e2e/lifecycle.test.js             L5 — child-process scenarios (runtime-generated, port-shifted copy)
+├── e2e/lifecycle.test.js             L5 — child-process scenarios (generated copy, acquired free port)
 ├── helpers/                          captureHandler, loadServer, spawnServer, rawExchange, httpClient
 └── fixtures/expected.js              frozen expected-value module
 ```
@@ -107,10 +131,11 @@ test/
 
 ### Ports
 
-- **TCP `127.0.0.1:3000` must be free before the run.** This is both a pre-condition and a
-  post-condition: after a full run **no listening socket remains**. The bootstrap tier releases port
-  3000 on an unconditional teardown path, and the lifecycle tier asserts the same for its own fixture
-  port with a native bind probe rather than by parsing a socket table.
+- **TCP `127.0.0.1:3000` must be free before the run — and it is the suite's *only* port
+  precondition.** This is both a pre-condition and a post-condition: after a full run **no listening
+  socket remains**. The bootstrap tier releases port 3000 on an unconditional teardown path, and the
+  lifecycle tier asserts the same for the port it acquired, with a native bind probe rather than by
+  parsing a socket table.
 - `test/e2e/bootstrap.test.js` (L4) is the **only** file in the suite that binds it, because it is
   the only file that loads `server.js` for real. The port is a hard-coded literal with no override
   path, so there is nothing to redirect. Its first case reads the address back from `address()` on
@@ -125,9 +150,27 @@ test/
   passes while another process holds `127.0.0.1:3000` — verified by running it against an external
   holder.
 - L2 and L3 mount the captured handler on **ephemeral port `0`**.
-- L5 spawns a child process running a runtime-generated, **port-shifted** copy of `server.js` written
-  into a temporary directory and removed unconditionally afterwards. The shifted port is deliberately
-  four digits, so the readiness line stays exactly 41 bytes.
+- L5 spawns a child process running a runtime-generated, **port-shifted** copy of `server.js`, written
+  into a fresh temporary directory that the child is also **launched in** (`cwd`). Its module-resolution
+  root is therefore that empty directory rather than this repository, which is what makes the
+  cold-start claim evidence rather than arrangement — the scenario asserts the launch directory, that
+  it is not the runner's own and not beneath it, and that no manifest or package tree exists on any
+  ancestor Node would search. The directory is removed unconditionally afterwards.
+- **L5 acquires every port by proof, and has no fixed port and no port precondition of its own.** Each
+  scenario walks a four-digit range from a process-derived offset and takes the first candidate a real
+  listening bind proves free, never offering the same port twice in one run. Four digits is deliberate:
+  it keeps the readiness line exactly 41 bytes. A probe can only prove an address free at the instant
+  it is probed, so a child that loses the race between the probe and its own bind is identified by its
+  `EADDRINUSE` diagnostic and re-spawned on a freshly proven port, bounded at four attempts; every
+  other start failure is reported unchanged rather than retried. Verified against an external holder:
+  the tier passes with the *previously* fixed ports 4311, 4312 and 4313 all occupied, and it also
+  passes with the **first 40 candidates of its own walk** pre-bound — measured by publishing the
+  runner's in-band pid and gating the run until the holder confirmed all 40 addresses bound. Hold more
+  candidates than the walk's 64-attempt budget and it fails in milliseconds with a diagnostic naming
+  the range, the host and every verdict it saw, rather than looping.
+- The two scenarios that need two children on **one** address — port contention and restart — share a
+  single acquired value explicitly. That is the only place a port is deliberately reused, and in the
+  contention case reusing an address while it is *known* to be occupied is the entire point.
 - A pipeline agent that pre-binds port 3000 will fail the bootstrap tier and nothing else. The unit,
   contract, protocol and lifecycle tiers are unaffected: none of them touches that address.
 - The runner is pinned to a single worker (`maxWorkers: 1`) because parallel workers were observed
@@ -137,7 +180,9 @@ test/
 `127.0.0.1:3000`: **9 of the 10 bootstrap cases fail** with
 `listen EADDRINUSE: address already in use 127.0.0.1:3000`, the tenth passes because it is purely
 structural and never needs the bind to succeed, and **all four other suites pass** — 52 passed /
-9 failed / 61 total, one failed suite. The remedy is to free the port, never to change it:
+9 failed / 61 total, one failed suite. Selected alone under that same holder, `test:unit` reports
+13 passed and `test/e2e/lifecycle.test.js` reports 7 passed, which is the positive confirmation that
+neither tier depends on that address. The remedy is to free the port, never to change it:
 `server.js` hard-codes the endpoint and is the
 behavioural contract this suite asserts, so it is read and never edited. The usual holders are a
 stray `node server.js` left behind by an earlier `npm start` and a second checkout of this
@@ -199,11 +244,23 @@ they are asserted on their response bytes and are never treated as thrown or rej
 ### Provenance
 
 Measured rather than estimated, on **Node.js 24.18.1 / npm 11.18.0**: 61 tests across 5 suites in
-0.699 s of runner time (1.166 s under `test:ci`); 13 / 31 / 17 tests in the unit, integration and
-e2e subsets; 303 installed packages from 331 lockfile entries; 0 audit findings on the whole tree and
-on the production tree; 100% on all four coverage metrics (9/9, 0/0, 2/2, 9/9); the 14-byte body with
-digest `c98c24b6…ad31`; and the 41-byte readiness line. The installed `jest` package is 30.4.2 while
-its CLI self-reports 30.4.1, because the constituent packages version independently.
+0.695 s of runner time (1.245 s under `test:ci`); 13 / 31 / 17 tests in the unit, integration and
+e2e subsets; **297 installed packages from 325 lockfile entries** (`lockfileVersion 3`, every entry
+carrying a `resolved` URL and an `integrity` digest); 0 audit findings on the whole tree and on the
+production tree, with `npm ls --omit=dev --all` reporting an empty tree; 100% on all four coverage
+metrics (9/9, 0/0, 2/2, 9/9); the 14-byte body with digest `c98c24b6…ad31`; and the 41-byte readiness
+line. The installed `jest` package is 30.4.2 while its CLI self-reports 30.4.1, because the
+constituent packages version independently.
+
+**Two divergences from the project plan are disclosed rather than presented as compliance.** First,
+the `overrides` block carries three entries where the plan authorises one; the measurement behind that
+choice, and the fact that it is a deviation, are set out in full under *Why `overrides` has three
+entries* above. Second, **`.npmrc` is not one of the artefacts the plan's transformation map
+enumerates.** It exists because the plan separately *mandates* `--ignore-scripts` at install time, and
+a flag documented only in prose is not a control — a plain `npm install` or `npm ci` would still
+execute lifecycle code. It adds no dependency, no script and no build step, and re-locking with the
+file removed was measured to produce a byte-identical `package-lock.json`, so it changes only whether
+lifecycle code runs, never what is resolved. The file's own header carries this same note.
 
 `server.js` was **not modified** by this work — its SHA-256 remains
 `332fc2d04eb5b8f3cb230855457af80d0dfc246f958d6e49615610d656acc2e0`, byte-identical to the committed

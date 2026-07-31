@@ -6,8 +6,29 @@
  * CHILD PROCESS ONLY, ON A SHIFTED FOUR-DIGIT PORT. Every scenario here runs the subject as a
  * genuine operating-system process started by the child-process harness, which writes a copy
  * differing from `server.js` on exactly one line - the port declaration - into a fresh system
- * temp directory. A four-digit replacement keeps the readiness banner exactly READY_BYTES long,
- * so every byte-count assertion below holds unchanged.
+ * temp directory AND LAUNCHES THE CHILD IN THAT DIRECTORY. A four-digit replacement keeps the
+ * readiness banner exactly READY_BYTES long, so every byte-count assertion below holds unchanged.
+ *
+ * THE CHILD'S WORKING DIRECTORY IS THE GENERATED ONE, AND THE COLD-START CLAIM DEPENDS ON IT.
+ * Writing a copy into an empty directory proves nothing on its own: a child that inherits the
+ * runner's working directory resolves modules against THIS REPOSITORY - a tree holding a manifest
+ * and hundreds of installed packages - so "starts with zero packages installed" would be asserted
+ * about a directory the process never actually ran in. The harness therefore launches the child
+ * with that directory as its own, and the cold-start scenario asserts the launch directory rather
+ * than assuming it: equal to the generated directory, holding the generated copy, outside the
+ * runner's directory entirely, and with no manifest or package tree anywhere on the chain of
+ * parents Node would search upward. The claim is then evidence rather than arrangement.
+ *
+ * EVERY PORT IS ACQUIRED BY PROOF, NEVER ASSUMED FREE. A fixed shifted port is a fixed address
+ * like any other: an unrelated process already holding one makes the child fail to bind, and the
+ * scenario then fails for a reason that has nothing to do with the subject. No port literal
+ * appears in this file and the harness's own default is never relied upon. Instead
+ * `acquireFreePort` below walks a four-digit range from a process-derived offset and returns the
+ * first candidate a real listening bind proves free, and `spawnOnFreePort` spawns on that port and
+ * RE-ACQUIRES if the address was taken between the probe and the bind - a window no check can
+ * close, only recover from. Ports handed out are never offered twice within a run, so scenarios
+ * cannot collide with each other; the two cases that need two children on ONE address share a
+ * single acquired value explicitly, because there a conflict is the point.
  *
  * CONTRACT D2 - THIS FILE NEVER LOADS THE SUBJECT IN-PROCESS. Loading it for real, and binding
  * its own fixed address, belongs to the sibling bootstrap tier and to that tier alone: two files
@@ -124,27 +145,77 @@ const BANNER_PREFIX = 'Server running at http://';
 const BANNER_SUFFIX = '/';
 
 /**
- * Port shared by the two children in the port-contention scenario.
+ * Lowest port the acquisition walk will offer.
  *
- * Passed EXPLICITLY to both spawns, because a conflict is only deterministic when both children
- * aim at the same address. Four digits, so the banner's byte length is unaffected, and
- * deliberately not the harness's own default, so a port that is expected to be fought over can
- * never be confused with the one the other scenarios use.
+ * Above the privileged range on purpose. A bind below it is refused for want of privilege rather
+ * than because anything is listening, and the classifier below treats an unanticipated refusal as
+ * a failure to report rather than a verdict to guess at - so offering such a port would turn a
+ * permissions fact into an unclassifiable error. Four digits, like the ceiling.
  *
  * @type {number}
  */
-const CONTENDED_PORT = 4312;
+const PORT_FLOOR = 1024;
 
 /**
- * Port bound twice in sequence by the restart-determinism scenario.
+ * Highest port the acquisition walk will offer.
  *
- * The same reasoning applies: the second spawn must reclaim the first one's exact address for
- * the comparison to mean anything, and keeping that address distinct from every other scenario's
- * makes each case independent of the order they run in.
+ * The four-digit ceiling, and the reason the readiness banner's byte count is invariant across
+ * every scenario here: a port of any other width would change the banner's length and break every
+ * READY_BYTES assertion in this file.
  *
  * @type {number}
  */
-const RESTART_PORT = 4313;
+const PORT_CEILING = 9999;
+
+/**
+ * How many candidates the acquisition walk will try before giving up.
+ *
+ * Bounded so a host with no free four-digit port fails with a legible diagnostic instead of
+ * looping. Generous relative to the number of ports this file needs - seven scenarios, at most one
+ * acquisition each - while still tiny beside the range being walked, so exhaustion means the host
+ * genuinely has nothing to offer rather than that the walk was unlucky.
+ *
+ * @type {number}
+ */
+const PORT_ACQUISITION_ATTEMPTS = 64;
+
+/**
+ * How many times a scenario's spawn will re-acquire after losing a bind race.
+ *
+ * A probe proves an address free at the instant it is probed, and the child binds a moment later:
+ * nothing can close that window, so it is recovered from instead. More than one retry is pointless
+ * on an idle host and more than a few would mask a real conflict, so the bound is small and the
+ * final failure carries the original diagnostic as its cause.
+ *
+ * @type {number}
+ */
+const SPAWN_ATTEMPTS = 4;
+
+/**
+ * Ports already handed out during this file's run, so none is ever offered twice.
+ *
+ * Two purposes. A port that lost a bind race is recorded before the retry, so the retry cannot
+ * hand back the address that just failed. And two scenarios can never be given the same port even
+ * if the first one's child has since been torn down and its address released - which keeps each
+ * case independent of the order they run in, exactly as distinct fixed ports used to, but without
+ * assuming any of them was free.
+ *
+ * @type {Set<number>}
+ */
+const claimedPorts = new Set();
+
+/**
+ * Where the next acquisition walk starts, seeded from this process so concurrent runs diverge.
+ *
+ * A walk that always began at the same candidate would put two runners on the same host in step
+ * with each other, each probing the port the other is about to bind. Seeding from the process
+ * identifier separates them without randomness, so a failure is reproducible from the process it
+ * happened in. It advances past every candidate the walk consumes, so successive acquisitions in
+ * one run continue where the previous one stopped rather than re-treading it.
+ *
+ * @type {number}
+ */
+let portCursor = process.pid;
 
 /**
  * The probed address accepted a listening bind, so nothing is listening on it.
@@ -416,6 +487,160 @@ function probeBind(host, port) {
 }
 
 /**
+ * Return a four-digit port that a real listening bind has just PROVEN free.
+ *
+ * This is the whole reason no port literal appears in this file. A fixed shifted port is a fixed
+ * address like any other, and an unrelated process already holding it makes the child fail to bind
+ * - so the scenario fails for a reason that has nothing to do with the subject. Proving each
+ * address before it is used moves that class of failure out of the suite.
+ *
+ * The proof is the same native bind probe the hygiene scenario rests on, which is what makes it a
+ * proof rather than a guess: it attempts the listening bind itself, so it filters on the LISTENING
+ * state for free and cannot be fooled by connections winding down on the same local address. No
+ * external utility is consulted and no socket table is parsed.
+ *
+ * Candidates are walked from a process-derived offset rather than chosen randomly, so two runners
+ * on one host diverge while a failure stays reproducible from the process it happened in. The walk
+ * skips the subject's own port - reserved for the sibling tier that binds it, and rejected by the
+ * harness anyway - and skips anything already handed out during this run.
+ *
+ * @returns {Promise<number>} A four-digit port that was free when probed and is now claimed.
+ * @throws {Error} When the bounded walk finds no free candidate, naming every verdict it saw.
+ */
+async function acquireFreePort() {
+  const span = PORT_CEILING - PORT_FLOOR + 1;
+  const rejected = [];
+
+  for (let attempt = 0; attempt < PORT_ACQUISITION_ATTEMPTS; attempt += 1) {
+    // The cursor only ever increases and is seeded from a positive process identifier, so the
+    // remainder is always in range and the candidate is always four digits.
+    const candidate = PORT_FLOOR + (portCursor % span);
+    portCursor += 1;
+
+    if (candidate === expected.PORT || claimedPorts.has(candidate)) {
+      continue;
+    }
+
+    const verdict = await probeBind(expected.HOST, candidate);
+
+    if (verdict === FREE) {
+      claimedPorts.add(candidate);
+      return candidate;
+    }
+
+    // Recorded so an exhausted walk can say WHAT it saw rather than merely that it failed, and
+    // bounded by construction: the list can never hold more entries than the attempt budget, so
+    // the diagnostic below has a fixed worst-case size rather than an open-ended one. An
+    // unclassifiable refusal never reaches here - the probe rejects on those, and that rejection
+    // propagates out of this helper unchanged.
+    rejected.push(candidate + '=' + verdict);
+  }
+
+  throw new Error(
+    'acquireFreePort: no free port in ' + PORT_FLOOR + '-' + PORT_CEILING + ' on ' +
+    expected.HOST + ' after ' + PORT_ACQUISITION_ATTEMPTS + ' candidates (verdicts: ' +
+    (rejected.length === 0 ? 'none probed' : rejected.join(', ')) + '; claimed this run: ' +
+    (claimedPorts.size === 0 ? 'none' : Array.from(claimedPorts).join(', ')) + ')'
+  );
+}
+
+/**
+ * Spawn a child on a freshly proven port, await its readiness, and return the tracked handle.
+ *
+ * A probe proves an address free at the instant it is probed, and the child binds a moment later.
+ * Nothing can close that window - so instead of pretending it does not exist, this recovers from
+ * it: a readiness failure whose diagnostic names a bind conflict is treated as a lost race, the
+ * port is left claimed so it is never offered again, and the spawn is retried on a fresh one.
+ *
+ * Every other readiness failure is re-thrown UNCHANGED, which is what keeps this a race recovery
+ * rather than a general retry that could mask a real defect: a child that failed for any other
+ * reason fails the scenario exactly as it did before, with its original diagnostic.
+ *
+ * The returned handle is ALREADY REGISTERED for teardown - registration happens at creation, for
+ * every attempt including the ones that lost - so callers must not register it again, and a
+ * scenario that fails immediately still has every child and every generated directory reclaimed.
+ *
+ * @param {object} [options] Harness options; any `port` given is replaced by the acquired one.
+ * @returns {Promise<object>} The tracked handle of a child that has reached readiness.
+ * @throws {Error} The original readiness failure, or - after the bound is exhausted - a race
+ *   diagnostic carrying the last one as its cause.
+ */
+async function spawnOnFreePort(options) {
+  const requested = options === undefined || options === null ? {} : options;
+  let lastRace;
+
+  for (let attempt = 1; attempt <= SPAWN_ATTEMPTS; attempt += 1) {
+    const port = await acquireFreePort();
+    const handle = track(spawnServer(Object.assign({}, requested, { port: port })));
+
+    try {
+      await handle.ready;
+      return handle;
+    } catch (readinessFailure) {
+      // A child that is STILL RUNNING cannot have lost a bind race: the readiness failures that
+      // leave one alive come from the spawn attempt itself, not from the address. Re-thrown at
+      // once - which also keeps the wait below guaranteed to resolve rather than subscribing to a
+      // termination that has not happened and may never happen.
+      if (!handle.hasExited()) {
+        throw readinessFailure;
+      }
+
+      // Sequenced on CLOSE, never on exit. The uncaught bind diagnostic is written moments before
+      // the process dies and can still be in the pipe when 'exit' fires, so classifying on
+      // `stderr()` any earlier would race those bytes and misread a lost race as a real failure.
+      // The wait is guarded by the harness, so an already-closed child resolves immediately.
+      await handle.waitForClose();
+
+      if (handle.stderr().indexOf(ADDRESS_IN_USE) === -1) {
+        throw readinessFailure;
+      }
+
+      lastRace = readinessFailure;
+
+      // Released now rather than left to the shared teardown, so a retry does not accumulate
+      // generated directories. The harness's cleanup is idempotent, so the teardown still runs
+      // over this handle harmlessly.
+      await handle.cleanup();
+    }
+  }
+
+  throw new Error(
+    'spawnOnFreePort: lost the bind race on ' + SPAWN_ATTEMPTS +
+    ' freshly probed ports in a row, so the host is churning through four-digit addresses faster ' +
+    'than they can be claimed',
+    { cause: lastRace }
+  );
+}
+
+/**
+ * Every directory Node would consult when resolving a module from `from` upward, root included.
+ *
+ * The cold-start claim is about what the child could REACH, not merely about what sits next to it:
+ * module resolution walks parents until the filesystem root, so a manifest or a package tree on
+ * any ancestor of the child's working directory is reachable from it. Listing the chain lets the
+ * scenario assert against all of it and name the offender if one appears.
+ *
+ * @param {string} from The directory to start from.
+ * @returns {Array<string>} The directory and each of its ancestors, nearest first.
+ */
+function resolutionChain(from) {
+  const chain = [];
+  let current = path.resolve(from);
+
+  for (;;) {
+    chain.push(current);
+    const parent = path.dirname(current);
+
+    // The root is its own parent, which is the only portable way to know the walk is finished.
+    if (parent === current) {
+      return chain;
+    }
+
+    current = parent;
+  }
+}
+
+/**
  * The ENTRY POINTS by which a Node program obtains a second process, or sheds the one it has.
  *
  * Absence of every one of them from the executed code is a structural proof that no fork, no
@@ -477,20 +702,45 @@ afterEach(async () => {
 
 describe('lifecycle (L5)', () => {
   test('S1 starts from a bare checkout as a single foreground process with zero packages installed (F-005-RQ-002, F-005-RQ-004, ST-1)', async () => {
-    const handle = track(spawnServer());
-
     // Readiness is the proof that the start SUCCEEDED, and it is a stdout pattern match rather
-    // than a wait: the promise resolves the moment the banner appears, or rejects if the child
-    // ends first, so a failed start fails this case rather than running out the safety bound.
-    await handle.ready;
+    // than a wait: this resolves the moment the banner appears, and rejects if the child ends
+    // first for any reason other than losing the bind race it retries - so a genuinely failed
+    // start fails this case rather than running out the safety bound. The port was proven
+    // bindable beforehand, and the handle comes back already registered for teardown.
+    const handle = await spawnOnFreePort();
 
-    // Nothing was installed for the child, and nothing could have been: the directory it runs
-    // from holds no manifest to install from and no package tree to resolve against. Filtering
-    // rather than testing each entry separately means a failure names the offending artefact.
-    const installed = INSTALL_ARTEFACTS.filter(
-      (artefact) => fs.existsSync(path.join(handle.dir, artefact))
-    );
-    expect(installed).toStrictEqual([]);
+    // THE CHILD ACTUALLY RAN THERE - ASSERTED, NOT ASSUMED.
+    //
+    // Every claim below about "zero packages installed" is a claim about the directory the process
+    // resolved modules from, so that directory is established FIRST. A child left to inherit the
+    // runner's working directory resolves against THIS REPOSITORY - a tree carrying a manifest and
+    // hundreds of installed packages - and the assertions that follow would then be describing a
+    // directory the process never entered, passing while proving nothing.
+    expect(handle.cwd).toBe(handle.dir);
+    expect(path.dirname(handle.file)).toBe(handle.cwd);
+
+    // The direct negation of that defect, stated separately so it cannot be met by coincidence:
+    // the launch directory is neither the runner's own nor anywhere beneath it.
+    expect(handle.cwd).not.toBe(process.cwd());
+    expect(handle.cwd.startsWith(process.cwd() + path.sep)).toBe(false);
+
+    // Nothing was installed for the child, and nothing could have been - not in the directory it
+    // ran in, and not on any ancestor of it either, which is as far as module resolution ever
+    // looks. Collecting the offenders rather than testing entries one at a time means a failure
+    // names the artefact AND the directory it was reachable from.
+    const reachable = [];
+
+    for (const directory of resolutionChain(handle.cwd)) {
+      for (const artefact of INSTALL_ARTEFACTS) {
+        const candidate = path.join(directory, artefact);
+
+        if (fs.existsSync(candidate)) {
+          reachable.push(candidate);
+        }
+      }
+    }
+
+    expect(reachable).toStrictEqual([]);
 
     // Asserted as the COMPLETE listing, so an unexpected extra file fails the case instead of
     // slipping past a check for specific absences. The generated copy's own name is read from
@@ -543,8 +793,7 @@ describe('lifecycle (L5)', () => {
   });
 
   test('S2 emits exactly one 41-byte readiness line (F-004-RQ-001)', async () => {
-    const handle = track(spawnServer());
-    await handle.ready;
+    const handle = await spawnOnFreePort();
 
     // The banner's shape is tied back to the frozen fixture first: composing at the subject's
     // own port must reproduce the frozen line byte for byte. Without this, the local composition
@@ -573,8 +822,7 @@ describe('lifecycle (L5)', () => {
   });
 
   test('S3 exits immediately on SIGTERM without draining (F-002-RQ-005, F-004-RQ-003)', async () => {
-    const handle = track(spawnServer());
-    await handle.ready;
+    const handle = await spawnOnFreePort();
 
     // The signal and the outcome in one guarded step. Nothing waits on the clock: the harness
     // inspects the recorded terminal state before subscribing, so an exit that has already
@@ -605,15 +853,20 @@ describe('lifecycle (L5)', () => {
   test('S4 exits non-zero with an EADDRINUSE diagnostic when the port is contended (F-002-RQ-004)', async () => {
     // The blocker holds the address first, which is what makes the conflict deterministic: the
     // failure is arranged rather than hoped for, so this case cannot pass by accident on a busy
-    // host or fail by accident on an idle one.
-    const first = track(spawnServer({ port: CONTENDED_PORT }));
-    await first.ready;
+    // host or fail by accident on an idle one. The address is one this scenario has just proven
+    // free, so the conflict below is the one it arranged and not one it inherited from the host.
+    const first = await spawnOnFreePort();
 
     // Deliberately NOT awaited for readiness: this child cannot become ready, so its readiness
     // promise rejects. The harness marks that promise handled at creation, which is what stops
     // the rejection aborting the run - awaiting it here would instead turn an expected failure
     // into a thrown error and lose the exit-code evidence this case exists to collect.
-    const second = track(spawnServer({ port: CONTENDED_PORT }));
+    //
+    // The blocker's OWN port is passed explicitly instead of acquiring a second one, because a
+    // conflict is only deterministic when both children aim at the same address. This is one of
+    // exactly two places in the file where a port is reused, and the only one where it is reused
+    // while KNOWN to be occupied - which is the entire point of the scenario.
+    const second = track(spawnServer({ port: first.port }));
 
     // Only this child's TERMINATION is awaited - never its readiness - and it is awaited through
     // `waitForClose()` rather than `waitForExit()`, because the assertions below read stream
@@ -646,8 +899,7 @@ describe('lifecycle (L5)', () => {
   });
 
   test('S5 produces a byte-identical readiness line and response after restart (F-001-RQ-003)', async () => {
-    const before = track(spawnServer({ port: RESTART_PORT }));
-    await before.ready;
+    const before = await spawnOnFreePort();
 
     const firstStdout = before.stdout();
     const firstResponse = await httpClient.get(before.port);
@@ -658,8 +910,12 @@ describe('lifecycle (L5)', () => {
     await before.stop(TERMINATION_SIGNAL);
     await before.cleanup();
 
-    // The SAME port, so this is a restart rather than a second unrelated server.
-    const after = track(spawnServer({ port: RESTART_PORT }));
+    // The SAME port, so this is a restart rather than a second unrelated server - and passed
+    // explicitly rather than acquired, because acquiring would hand back a DIFFERENT address and
+    // turn a restart into two unrelated servers. Re-probing it first would be theatre: the stop
+    // above released it a moment ago, and if anything else has claimed it since, this case must
+    // fail loudly rather than quietly relocate and compare two different addresses.
+    const after = track(spawnServer({ port: before.port }));
     await after.ready;
 
     const secondStdout = after.stdout();
@@ -687,8 +943,7 @@ describe('lifecycle (L5)', () => {
   testWithRoutableAddress(
     'S6 confines reachability to loopback and refuses the routable address (F-002-RQ-002)',
     async () => {
-      const handle = track(spawnServer());
-      await handle.ready;
+      const handle = await spawnOnFreePort();
 
       // Loopback connects and serves, so the server is genuinely reachable and the refusal below
       // cannot be explained away as a server that was never listening.
@@ -708,8 +963,7 @@ describe('lifecycle (L5)', () => {
   );
 
   test('S7 leaves no listening socket after termination (F-002-RQ-005)', async () => {
-    const handle = track(spawnServer());
-    await handle.ready;
+    const handle = await spawnOnFreePort();
 
     // A negative control BEFORE the post-condition, because a probe that detected nothing at all
     // would satisfy the assertions below exactly as a clean host does. While the child is

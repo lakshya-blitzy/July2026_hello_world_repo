@@ -16,13 +16,22 @@
  *
  * EXPORTED SURFACE
  *   spawnServer(options?) -> handle          synchronous; throws on invalid input
- *     options.port            number, default 4311  four-digit integer; 3000 is rejected
+ *     options.port            number, default 4311  four-digit integer; 3000 is rejected.
+ *                             THE DEFAULT IS A CONVENIENCE FOR AD-HOC USE, NOT A TEST CONTRACT:
+ *                             it is a fixed address like any other, so an ordinary process
+ *                             already holding it would fail the caller before its assertions
+ *                             ran. The lifecycle tier consequently never relies on it - every
+ *                             scenario passes a port it has just PROVEN bindable, and the two
+ *                             scenarios that need two children on one address share that proven
+ *                             value. Anything new that spawns a child must do the same.
  *     options.sourcePath      string, default path.resolve(process.cwd(), 'server.js');
  *                             DRIFT-VALIDATION ONLY when it is not the canonical subject
  *     options.maxStreamBytes  number, default 1048576  per-stream retention ceiling
  *   handle.child          the ChildProcess
  *   handle.port           the shifted port actually used (number)
  *   handle.dir            the freshly created system-temp directory
+ *   handle.cwd            the working directory the child was LAUNCHED with - equal to `dir`,
+ *                         exposed separately so a scenario can assert the equality
  *   handle.file           the generated port-shifted copy inside `dir`
  *   handle.readyLine      'Server running at http://127.0.0.1:<port>/'
  *   handle.ready          Promise; resolves at readiness, rejects if the child ends first
@@ -103,12 +112,20 @@
  *   belongs to the one test that binds the subject's own address. A loud guard here prevents
  *   a mystifying failure elsewhere.
  *
- * GENERATED, NEVER COMMITTED  The shifted copy goes into a freshly created directory under
- *   the SYSTEM temp directory, one per spawn, removed unconditionally. Nothing is written
- *   inside the working tree, so no ignore rule is needed and no second copy of the subject
- *   can drift out of step with it. That directory holds no `package.json` and no
- *   `node_modules/`, which is what makes the cold-start scenario a genuine test - the
+ * GENERATED, NEVER COMMITTED - AND THE CHILD ACTUALLY RUNS THERE  The shifted copy goes into a
+ *   freshly created directory under the SYSTEM temp directory, one per spawn, removed
+ *   unconditionally. Nothing is written inside the working tree, so no ignore rule is needed and
+ *   no second copy of the subject can drift out of step with it. That directory holds no
+ *   `package.json` and no `node_modules/`, and neither does any ancestor of it up to the
+ *   filesystem root - which is what makes the cold-start scenario a genuine test, since the
  *   subject's only import is the built-in `http` module.
+ *
+ *   The child is therefore spawned WITH `cwd` SET TO THAT DIRECTORY. Without it the child would
+ *   inherit the runner's own working directory - the repository root, manifest and installed
+ *   package tree included - and a cold-start assertion would be describing a directory the
+ *   process never ran in. `handle.cwd` reports the directory the child was launched with, so the
+ *   claim can be asserted rather than assumed. The copy itself is indifferent to the setting: its
+ *   one import is a built-in, and it is executed by absolute path.
  *
  * READINESS IS A COMPLETE-LINE STDOUT PATTERN MATCH, NEVER A SLEEP  `ready` resolves the moment
  *   the accumulated stdout contains `readyLine` FOLLOWED BY ITS NEWLINE, and rejects if the child
@@ -464,8 +481,11 @@ function resolveVerifiedSource(requestedPath) {
  *
  * @param {{ port?: number, sourcePath?: string, maxStreamBytes?: number }} [options]
  *   `port` - four-digit integer (1000-9999) other than 3000; defaults to 4311. Passing an
- *   explicit port is load-bearing: the port-contention scenario needs two children on the
- *   same port, and the restart-determinism scenario needs to re-spawn on the same port.
+ *   explicit port is load-bearing, and callers in the suite always do: a port verified free
+ *   immediately beforehand is the only kind that cannot fail a scenario on ordinary host
+ *   contention, the port-contention scenario needs two children on the same address, and the
+ *   restart-determinism scenario needs to reclaim the first child's exact address. The default is
+ *   retained for ad-hoc use only and carries the fixed-address hazard every fixed port carries.
  *   `sourcePath` - absolute or relative path to the subject; defaults to the repository
  *   root's `server.js`. Overriding it is how the drift alarm is exercised, by pointing at a
  *   deliberately malformed fixture inside a temp directory rather than by editing the
@@ -574,7 +594,17 @@ function spawnServer(options) {
     // because `resolveVerifiedSource` has already established that this copy came from the
     // canonical subject and from nowhere else. stdin is explicitly not connected, which keeps
     // every path non-interactive and pipeline-safe.
-    child = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'pipe'] });
+    //
+    // `cwd` IS THE GENERATED DIRECTORY, AND THAT IS THE WHOLE POINT OF GENERATING ONE. Omitting
+    // it makes the child inherit the RUNNER'S working directory - the repository root, complete
+    // with its manifest and its installed package tree - so a cold-start scenario would be
+    // asserting against a directory the child never actually ran in. Pointing it at `dir`
+    // instead is what makes "started from a bare checkout" a fact about the child rather than a
+    // property of a directory listing: the process's own working directory holds nothing but the
+    // copy, and so does every ancestor of it up to the filesystem root. Nothing in the copy
+    // depends on this - its single import is a built-in, resolved without touching the
+    // filesystem - so the change costs nothing and closes the gap.
+    child = spawn(process.execPath, [file], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (startError) {
     // Unconditional teardown applies to the construction path too: leaving
     // an orphaned temp directory behind would violate the suite's hygiene guarantee.
@@ -909,6 +939,11 @@ function spawnServer(options) {
     child: child,
     port: port,
     dir: dir,
+    // The working directory the child was actually LAUNCHED with, exposed separately from `dir`
+    // so a scenario can assert on the process's environment rather than on the directory this
+    // helper happened to create. The two are equal by construction, and stating both is what
+    // lets a test assert that equality instead of assuming it.
+    cwd: dir,
     file: file,
     readyLine: readyLine,
     ready: ready,
