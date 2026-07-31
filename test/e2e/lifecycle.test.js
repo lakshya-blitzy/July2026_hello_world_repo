@@ -24,15 +24,24 @@
  *
  * CONTRACT D3 - EVERY EXIT AWAIT IS GUARDED. Subscribing to a termination event that has already
  * fired hangs the scenario until the runner's safety bound expires - measured at 20,003 ms before
- * the guard and ~0 ms after it. Exits are therefore awaited only through the harness's
- * `waitForExit()` and `stop()`, both of which inspect the recorded terminal state before
- * subscribing to anything. No termination event is ever subscribed to directly in this file.
+ * the guard and ~0 ms after it. Terminations are therefore awaited only through the harness's
+ * `waitForExit()`, `waitForClose()` and `stop()`, all of which inspect the recorded terminal state
+ * before subscribing to anything. No termination event is ever subscribed to directly in this
+ * file.
+ *
+ * 'exit' IS NOT 'close', AND EVERY STREAM ASSERTION HERE NEEDS 'close'. A child's exit and the
+ * closure of the pipes the harness reads it through are distinct events: output written just
+ * before the process died can still be in flight when 'exit' fires. Every scenario that asserts on
+ * `stdout()` or `stderr()` CONTENT therefore sequences on close - through `stop()`, which resolves
+ * on close, or through `waitForClose()` for the contended child this file never stops itself.
+ * `waitForExit()` remains available for code-and-signal-only questions.
  *
  * CONTRACT E2 - THE CONTENDED CHILD'S READINESS PROMISE IS NEVER AWAITED. In the port-contention
  * scenario the second child ends before it can become ready, so its readiness promise rejects.
  * The harness marks that promise handled at creation, which is what keeps the rejection from
- * aborting the entire run; the scenario awaits only that child's EXIT and then asserts on the
- * recorded code, signal and streams. Every other scenario does await readiness first.
+ * aborting the entire run; the scenario awaits only that child's TERMINATION - on close, since it
+ * asserts stream content - and then asserts on the recorded code, signal and streams. Every other
+ * scenario does await readiness first.
  *
  * S-2 - READINESS IS A STDOUT PATTERN MATCH, NEVER A SLEEP. This file creates no timer of any
  * kind and never synchronises on wall-clock time. The failure path is made deterministic by
@@ -528,7 +537,7 @@ afterEach(async () => {
 });
 
 describe('lifecycle (L5)', () => {
-  test('S1 starts from a bare checkout with zero packages installed (F-005-RQ-002)', async () => {
+  test('S1 starts from a bare checkout with zero packages installed (F-005-RQ-002, ST-1)', async () => {
     const handle = track(spawnServer());
 
     // Readiness is the proof that the start SUCCEEDED, and it is a stdout pattern match rather
@@ -633,8 +642,16 @@ describe('lifecycle (L5)', () => {
     // into a thrown error and lose the exit-code evidence this case exists to collect.
     const second = track(spawnServer({ port: CONTENDED_PORT }));
 
-    // Only the EXIT is awaited, through the guarded accessor.
-    const outcome = await second.waitForExit();
+    // Only this child's TERMINATION is awaited - never its readiness - and it is awaited through
+    // `waitForClose()` rather than `waitForExit()`, because the assertions below read stream
+    // CONTENT. 'exit' reports only that the process has ended: the uncaught EADDRINUSE stack
+    // trace is written moments before it dies and can still be in the pipe at that point, so an
+    // `stderr()` assertion sequenced on 'exit' alone races those bytes. 'close' is emitted once
+    // the stdio streams are finished, so both accumulators are complete when this resolves. It
+    // reports the same recorded code and signal, and it is guarded identically, so an
+    // already-ended child resolves immediately instead of subscribing to an event that can no
+    // longer fire (contract D3).
+    const outcome = await second.waitForClose();
 
     // A code rather than a signal, and specifically the uncaught-exception code: the subject
     // registers no 'error' listener, so the bind failure propagates as an unhandled event. This

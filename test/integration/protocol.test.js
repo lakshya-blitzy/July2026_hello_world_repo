@@ -230,17 +230,22 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  // Unconditional: this runs after a failed assertion exactly as after a passing one. A
-  // keep-alive connection would otherwise be held open by the runtime for its idle timeout and
-  // delay the close, so lingering connections are dropped first.
+  // Unconditional: this runs after a failed assertion exactly as after a passing one.
   if (server) {
-    if (typeof server.closeAllConnections === 'function') {
-      server.closeAllConnections();
-    }
     if (server.listening) {
-      await new Promise((resolve) => {
+      // ORDER IS LOAD-BEARING: request the close FIRST, then drop the connections that are still
+      // open. A keep-alive connection - or a raw socket one of the cases below left behind - would
+      // otherwise be held open by the runtime for its idle timeout and defer the close, which is
+      // why `closeAllConnections()` is needed. Force-closing before the close is requested leaves
+      // a window in which the listener is still accepting, so a connection can arrive between the
+      // two calls and keep the server alive; Node's guidance is to force-close only afterwards.
+      const closed = new Promise((resolve) => {
         server.close(resolve);
       });
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
+      await closed;
     }
     server = null;
     port = 0;

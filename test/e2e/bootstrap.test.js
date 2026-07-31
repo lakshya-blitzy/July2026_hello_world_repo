@@ -35,11 +35,19 @@
  * gone through that factory first, the harness's first recorded call would be the blocker's and
  * every snapshot would describe the wrong server.
  *
+ * MOCK OWNERSHIP IS REFERENCE-SPECIFIC, AND THE LAST CASE PROVES IT. The harness restores the two
+ * spies it installed - the HTTP server factory and the console - by reference, and never touches a
+ * mock it did not install. That matters because a case here may legitimately install a spy of its
+ * own and still need it after the harness has been torn down, which happens mid-test as well as
+ * from the unconditional teardown below. The final case is the executable regression guard for
+ * that contract.
+ *
  * REPORT, DO NOT REPAIR: `server.js` registers no 'error' listener, so a failed bind is an
- * unhandled 'error' event. The last case asserts that gap as CURRENT behaviour. The listener that
- * makes it observable belongs to the harness, on the server instance, and is never tidied into the
- * subject - which stays byte-identical. Forcibly terminating the runner is forbidden for the same
- * reason: a runner that will not exit is reporting a leak to be fixed on the teardown path below.
+ * unhandled 'error' event. The bind-failure case asserts that gap as CURRENT behaviour. The
+ * listener that makes it observable belongs to the harness, on the server instance, and is never
+ * tidied into the subject - which stays byte-identical. Forcibly terminating the runner is
+ * forbidden for the same reason: a runner that will not exit is reporting a leak to be fixed on
+ * the teardown path below.
  */
 
 const fs = require('fs');
@@ -94,6 +102,25 @@ const ERROR_BRAND = '[object Error]';
  * @type {string}
  */
 const ONLY_SPECIFIER = 'http';
+
+/**
+ * Sentinels for the mock-ownership regression case.
+ *
+ * Test-local values with no relationship whatsoever to the subject, which is exactly the point:
+ * the spy that returns them belongs to the TEST, so the harness must leave it precisely as it
+ * found it while still restoring the two spies it installed itself.
+ *
+ * @type {string}
+ */
+const OWNED_BY_TEST = 'installed-by-the-test';
+
+/**
+ * What the unspied implementation returns, so the restoration can be asserted on a value rather
+ * than on the absence of one.
+ *
+ * @type {string}
+ */
+const NOT_SPIED = 'the-real-implementation';
 
 /**
  * Every `require(...)` call in a source text, as the specifiers it names.
@@ -447,5 +474,37 @@ describe('bootstrap (L4)', () => {
     expect(loaded.errors.length).toBe(1);
     expect(loaded.logs.length).toBe(0);
     expect(loaded.server.listening).toBe(false);
+  });
+
+  test('leaves a spy the test installed untouched when the harness tears down (S-4)', async () => {
+    // A spy that belongs to the TEST: installed before the harness runs and still needed after it
+    // has finished. Nothing about it relates to the subject.
+    const target = {
+      probe() {
+        return NOT_SPIED;
+      }
+    };
+    const targetSpy = jest.spyOn(target, 'probe').mockReturnValue(OWNED_BY_TEST);
+
+    loaded = await loadServerReady();
+
+    // Torn down explicitly, MID-TEST, which is precisely the situation the harness's ownership
+    // contract has to survive: a blanket restore-all inside its teardown would uninstall the spy
+    // above before this case could use it again. The unconditional teardown in `afterEach` is
+    // idempotent, so calling it here costs nothing later.
+    await loaded.teardown();
+
+    // The harness DID restore what it owns - its console spy is gone. The runner's own automatic
+    // restoration cannot account for this, because that is applied in a top-level `beforeEach`,
+    // i.e. at the start of the NEXT test, not at the end of this one.
+    expect(jest.isMockFunction(console.log)).toBe(false);
+
+    // ...and it left the test's own spy exactly as it found it.
+    expect(jest.isMockFunction(target.probe)).toBe(true);
+    expect(target.probe()).toBe(OWNED_BY_TEST);
+
+    // Restored by its owner, which is the whole point of the contract.
+    targetSpy.mockRestore();
+    expect(target.probe()).toBe(NOT_SPIED);
   });
 });

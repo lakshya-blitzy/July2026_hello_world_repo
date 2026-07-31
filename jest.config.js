@@ -70,9 +70,27 @@ module.exports = {
   // An enforcing gate derived from measurement rather than convention: Istanbul
   // instrumentation of the subject accounts for 9 statements, 0 branches, 2
   // functions and 9 lines, so a 100% ceiling is attainable rather than
-  // aspirational. `functions` is the metric that carries meaning here — the
-  // second function is the listen callback, reachable only when a bind
-  // succeeds, so satisfying it requires exercising startup for real.
+  // aspirational. A regression therefore fails the run instead of quietly
+  // lowering a number, and a suite that stopped exercising the subject cannot
+  // pass: a negative control — passing assertions with the subject never loaded
+  // — exits non-zero with explicit threshold violations.
+  //
+  // What this gate does NOT prove, stated plainly so it is never over-read: it
+  // is a SUITE-LIVENESS ALARM, not evidence that the server really starts.
+  // Because the subject has no conditionals, `branches` is trivially 100% at
+  // 0/0 and every statement is reached by loading the module once — and the
+  // stub-mode harness reaches even the second function, the listen callback,
+  // because `captureHandlerReady()` flushes that callback through a FAKE
+  // `listen` while no socket is ever bound. All four metrics can therefore read
+  // 100% with the fixed address never bound at all.
+  //
+  // Real startup is proved behaviourally instead, by test/e2e/bootstrap.test.js:
+  // it loads the subject through the call-through harness
+  // (`loadServerReady()`), asserts the real `address()` and the readiness line
+  // after the 'listening' event, and serves an actual request over the bound
+  // socket. Keep these four numbers at 100 and keep that tier — neither
+  // substitutes for the other. The substantive measure of thoroughness is the
+  // requirement-identifier mapping carried in the test titles, not this table.
   coverageThreshold: {
     global: {
       statements: 100,

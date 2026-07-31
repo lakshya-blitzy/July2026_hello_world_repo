@@ -151,6 +151,15 @@
  *   because that flag would mask the exact defect this discipline exists to
  *   catch.
  *
+ *   MOCK OWNERSHIP obeys the same reference-specific discipline: teardown
+ *   restores `createServerSpy` and `logSpy` - and nothing else - by calling
+ *   `mockRestore()` on each, mirroring `rollbackAcquisition`. A blanket
+ *   restore-all is forbidden here, because a bootstrap test may legitimately
+ *   install a spy of its own, and wiping it from an `afterEach` - or from a
+ *   mid-test teardown, which is supported - would remove it before that test's
+ *   own assertions or cleanup could use it. This harness never touches a mock it
+ *   did not install.
+ *
  * Importing this module has no side effects: it loads only Node built-ins, and
  * installs no spy, loads no subject, binds no socket and starts no timer until
  * `loadServer()` is called. There is no module-level mutable state, so any
@@ -700,8 +709,23 @@ function loadServer() {
    * skip the close and strand the listener that is about to appear. The bind
    * outcome is therefore awaited first, by event and never by timer.
    *
+   * MOCK OWNERSHIP - only the two spies this load installed are restored, and
+   * they are restored BY REFERENCE, exactly as `rollbackAcquisition` does on the
+   * failed-acquisition path. A blanket restore-all is deliberately never used
+   * here: it would also uninstall a spy the TEST owns - one it installed for its
+   * own assertions - and, because this teardown is meant to be called from an
+   * unconditional `afterEach` (or mid-test, since it is idempotent), that spy
+   * would vanish before the test's own assertions or cleanup could use it. The
+   * harness's non-interference contract is therefore reference-specific
+   * throughout, on both the success and the failure path. Each restore is
+   * attempted independently so a failure in one cannot skip the other, and
+   * `mockRestore()` is idempotent, so the runner's own automatic restoration -
+   * applied in a top-level `beforeEach`, i.e. at the START of the next test -
+   * remains a harmless second layer rather than a conflicting one.
+   *
    * @returns {Promise<void>} resolves once the server is closed, every listener
-   *   this harness attached is detached, and all mocks are restored.
+   *   this harness attached is detached, and the two spies this load owns are
+   *   restored.
    */
   async function teardown() {
     if (tornDown) {
@@ -712,13 +736,23 @@ function loadServer() {
     await bindSettled();
 
     if (server.listening) {
-      // Drop any lingering keep-alive connection first, so a client socket the
-      // test left open cannot delay - or indefinitely defer - the close.
-      if (typeof server.closeAllConnections === 'function') {
-        server.closeAllConnections();
-      }
-
-      await new Promise(function (resolve) {
+      // ORDER IS LOAD-BEARING: `close()` FIRST, then force-close what is already
+      // connected.
+      //
+      // `close()` stops the listener accepting anything new and completes once the
+      // last connection has gone; `closeAllConnections()` drops the connections
+      // that are still open, which is what stops a keep-alive socket a test left
+      // behind from deferring that completion for the runtime's whole idle
+      // timeout. Both are needed - but force-closing FIRST leaves a window in
+      // which the listener is still accepting, so a connection can arrive between
+      // the two calls and keep the server alive after all. Node's own guidance is
+      // therefore to force-close only after the close has been requested, and that
+      // is the order used here.
+      //
+      // `close()` is called synchronously inside the promise executor, so the
+      // close is already requested before the next statement runs; awaiting the
+      // promise afterwards is what makes teardown wait for completion.
+      const closed = new Promise(function (resolve) {
         // The close callback's error argument is deliberately ignored: the
         // `listening` guard above makes ERR_SERVER_NOT_RUNNING unreachable, and
         // a throwing teardown would mask the real assertion failure that led
@@ -727,6 +761,12 @@ function loadServer() {
           resolve();
         });
       });
+
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
+
+      await closed;
     }
 
     while (transientListeners.length > 0) {
@@ -741,7 +781,29 @@ function loadServer() {
     server.removeListener('listening', onListeningEvent);
     server.removeListener('close', onCloseEvent);
 
-    jest.restoreAllMocks();
+    // The EXACT two spies this load installed, restored by reference. Attempted
+    // independently so a throw from one still lets the other come back out, and
+    // the first failure is raised only after both attempts have been made - a
+    // half-restored world is worse than a late error.
+    let restoreFailure;
+
+    try {
+      createServerSpy.mockRestore();
+    } catch (createServerRestoreError) {
+      restoreFailure = createServerRestoreError;
+    }
+
+    try {
+      logSpy.mockRestore();
+    } catch (logRestoreError) {
+      if (restoreFailure === undefined) {
+        restoreFailure = logRestoreError;
+      }
+    }
+
+    if (restoreFailure !== undefined) {
+      throw restoreFailure;
+    }
   }
 
   return {

@@ -32,8 +32,12 @@
  *   handle.stderrBytes()  total stderr bytes SEEN, which exceeds the retained length on overflow
  *   handle.overflowError() the Error recorded if either ceiling was reached, else undefined
  *   handle.hasExited()    boolean
- *   handle.waitForExit()  Promise<{ code, signal }> - guarded; see the exit-await note below
- *   handle.stop(signal)   Promise<{ code, signal }> - signal defaults to 'SIGTERM'
+ *   handle.waitForExit()  Promise<{ code, signal }> - guarded; the PROCESS has ended
+ *   handle.waitForClose() Promise<{ code, signal }> - guarded; the process has ended AND its
+ *                         stdio pipes have closed. Await THIS before asserting on stdout()/
+ *                         stderr(); see the exit-await note below
+ *   handle.stop(signal)   Promise<{ code, signal }> - signal defaults to 'SIGTERM'; resolves on
+ *                         CLOSE, so the streams are complete when it returns
  *   handle.cleanup()      Promise<void> - idempotent and unconditional
  *   Requiring this module has no side effects: nothing is spawned, created or written
  *   until `spawnServer` is called, and no mutable state lives at module scope.
@@ -106,14 +110,25 @@
  *   `node_modules/`, which is what makes the cold-start scenario a genuine test - the
  *   subject's only import is the built-in `http` module.
  *
- * READINESS IS A STDOUT PATTERN MATCH, NEVER A SLEEP  `ready` resolves the moment the
- *   accumulated stdout contains `readyLine`, and rejects if the child ends first - quoting the
- *   exit code, the signal and a bounded summary of the captured stderr so a failed start fails
- *   legibly rather than running out the runner's safety bound. This file contains no timers of
- *   any kind and never synchronises on wall-clock time. Because readiness is detected in the
- *   retained text, a `maxStreamBytes` below the banner's own 41 bytes makes readiness
- *   unreachable by construction - which is why that case still fails fast and legibly, through
- *   the overflow kill and the resulting premature-end rejection, rather than silently waiting.
+ * READINESS IS A COMPLETE-LINE STDOUT PATTERN MATCH, NEVER A SLEEP  `ready` resolves the moment
+ *   the accumulated stdout contains `readyLine` FOLLOWED BY ITS NEWLINE, and rejects if the child
+ *   ends first - quoting the exit code, the signal and a bounded summary of the captured stderr so
+ *   a failed start fails legibly rather than running out the runner's safety bound. This file
+ *   contains no timers of any kind and never synchronises on wall-clock time.
+ *
+ *   THE TERMINATOR IS PART OF THE PATTERN, DELIBERATELY. A pipe delivers whatever bytes have
+ *   arrived, so the banner and the newline `console.log` appends can arrive in two separate
+ *   chunks. Matching the bare line would resolve readiness while stdout still held 40 bytes, and
+ *   a caller that immediately asserts `stdout() === readyLine + '\n'` or a 41-byte count - which
+ *   is exactly what the lifecycle tier's readiness, signal and restart scenarios do - would fail
+ *   intermittently on nothing but chunk timing. Requiring the terminator makes the resolution
+ *   point a whole line by construction, so every byte-exact stdout assertion is deterministic the
+ *   moment `ready` resolves.
+ *
+ *   Because readiness is detected in the retained text, a `maxStreamBytes` below the banner's own
+ *   41 bytes makes readiness unreachable by construction - which is why that case still fails
+ *   fast and legibly, through the overflow kill and the resulting premature-end rejection, rather
+ *   than silently waiting.
  *
  * DO NOT DELETE THE NO-OP `ready.catch`  The port-contention scenario legitimately never
  *   awaits `ready`, and its child ends before readiness, so that promise rejects unobserved -
@@ -126,7 +141,21 @@
  *   until the safety bound expires, whereas guarded it resolves at once. That state is
  *   recorded from both 'exit' and 'close', because a child that cannot be spawned emits
  *   'error' and 'close' but never 'exit'; an 'error' listener is always attached, since an
- *   unhandled 'error' event on a ChildProcess throws.
+ *   unhandled 'error' event on a ChildProcess throws. `waitForClose()` carries the same guard.
+ *
+ * 'exit' IS NOT 'close', AND STREAM ASSERTIONS NEED 'close'  A child's exit and the closure of
+ *   the pipes this helper reads it through are two distinct events: 'exit' reports that the
+ *   process has ended, while 'close' additionally reports that its stdio streams are finished, so
+ *   output still in flight when the process died has been delivered. Asserting on `stdout()` or
+ *   `stderr()` after nothing more than 'exit' is therefore a race - the contention scenario's
+ *   EADDRINUSE stack trace is written moments before the process dies and can still be in the
+ *   pipe. Two members exist so the distinction is explicit rather than assumed:
+ *     - `waitForExit()`  when only the exit CODE and SIGNAL matter, or when the child was not
+ *                        stopped by this helper (the contended child ends on its own);
+ *     - `waitForClose()` before any assertion on stream CONTENT.
+ *   `stop()` resolves on close, because every caller that stops a child then inspects what it
+ *   printed. Both are idempotent-safe: they resolve immediately when the state has already been
+ *   recorded, so a second await never hangs.
  *
  * CLEANUP IS IDEMPOTENT AND UNCONDITIONAL  Intended for an `afterEach`/`finally` path
  *   so it runs even when assertions fail: it terminates a still-running child, awaits the
@@ -654,6 +683,19 @@ function spawnServer(options) {
   // mirroring how the subject composes its banner. Never imported from the fixture module.
   const readyLine = 'Server running at http://' + LOOPBACK + ':' + port + '/';
 
+  // The COMPLETE readiness line, terminator included - what `console.log` actually writes, and
+  // what readiness is detected on.
+  //
+  // Detecting the bare `readyLine` was a race: a pipe delivers whatever bytes have arrived, so
+  // the banner and its newline can land in two separate chunks. Readiness would then resolve
+  // while stdout held 40 bytes, and a caller asserting `stdout() === readyLine + '\n'` or a
+  // 41-byte count immediately afterwards - exactly what the lifecycle tier does - would observe
+  // the line without its terminator and fail intermittently. Requiring the terminator makes the
+  // resolution point a complete line by construction, so every byte-exact stdout assertion is
+  // deterministic the moment `ready` resolves. It is still a pattern match on retained output,
+  // not a wall-clock wait: no timer exists anywhere in this file.
+  const readyBanner = readyLine + '\n';
+
   /**
    * Build the diagnostic used when the child ends before it ever became ready.
    *
@@ -695,7 +737,9 @@ function spawnServer(options) {
     }
 
     function onReadyData() {
-      if (out.indexOf(readyLine) !== -1) {
+      // The terminator is part of the pattern, so a chunk boundary between the banner and its
+      // newline cannot resolve readiness early; the next chunk completes the line and settles.
+      if (out.indexOf(readyBanner) !== -1) {
         settle(null);
       }
     }
@@ -712,8 +756,9 @@ function spawnServer(options) {
     }
 
     // Output may already have arrived, and the child may already have ended, before this
-    // promise was constructed; check the recorded state before subscribing to anything.
-    if (out.indexOf(readyLine) !== -1) {
+    // promise was constructed; check the recorded state before subscribing to anything. The
+    // same complete-line pattern applies here, for the same reason.
+    if (out.indexOf(readyBanner) !== -1) {
       settle(null);
       return;
     }
@@ -736,7 +781,13 @@ function spawnServer(options) {
   ready.catch(function () {});
 
   /**
-   * Resolve once the child has ended, reporting its exit code and terminating signal.
+   * Resolve once the child PROCESS has ended, reporting its exit code and terminating signal.
+   *
+   * This says nothing about the child's pipes: 'exit' can precede the closure of the stdio
+   * streams this helper reads, so output written just before the process died may still be in
+   * flight. Use this when only the code and the signal matter - or when the child ended on its
+   * own and the code is what is being asserted - and use {@link waitForClose} before asserting
+   * on `stdout()` or `stderr()` content.
    *
    * @returns {Promise<{ code: (number|null), signal: (string|null) }>}
    */
@@ -770,8 +821,18 @@ function spawnServer(options) {
   }
 
   /**
-   * Resolve once the child has ended AND its stdio streams have closed, so no pipe
-   * outlives the test. Internal: `cleanup` uses it to guarantee handle hygiene.
+   * Resolve once the child has ended AND its stdio streams have closed, so no pipe outlives the
+   * test and every byte the child wrote has been delivered to the accumulators.
+   *
+   * THIS IS THE WAIT TO USE BEFORE ASSERTING ON STREAM CONTENT. 'exit' reports only that the
+   * process has ended; a diagnostic written immediately beforehand - an uncaught EADDRINUSE stack
+   * trace, for instance - can still be in the pipe at that point, which makes an `stderr()`
+   * assertion sequenced on 'exit' alone a race. 'close' is emitted after the streams are
+   * finished, so the accumulators are complete when this resolves.
+   *
+   * Guarded exactly as {@link waitForExit} is: an already-recorded close resolves immediately
+   * rather than subscribing to an event that can no longer fire, so a second await never hangs.
+   * `cleanup` uses it too, to guarantee handle hygiene.
    *
    * @returns {Promise<{ code: (number|null), signal: (string|null) }>}
    */
@@ -789,6 +850,14 @@ function spawnServer(options) {
   /**
    * Signal the child and await its outcome in one step.
    *
+   * Resolves on CLOSE rather than on exit, so the child's stdio pipes are finished and both
+   * accumulators are complete when this returns. That is deliberate: every caller that stops a
+   * child goes on to assert what it printed - that termination emitted no further output, or that
+   * stdout is still exactly the readiness line - and sequencing on 'exit' alone would leave those
+   * assertions racing bytes still in the pipe. The extra wait is the pipe draining, not a delay:
+   * no timer is involved, and the returned code and signal are the same recorded values
+   * {@link waitForExit} reports.
+   *
    * @param {string} [signal] POSIX signal name; defaults to 'SIGTERM'
    * @returns {Promise<{ code: (number|null), signal: (string|null) }>}
    */
@@ -797,7 +866,7 @@ function spawnServer(options) {
     if (!exited) {
       child.kill(signal || 'SIGTERM');
     }
-    return waitForExit();
+    return waitForClose();
   }
 
   let cleaned = false;
@@ -866,6 +935,10 @@ function spawnServer(options) {
       return exited;
     },
     waitForExit: waitForExit,
+    // Exposed alongside `waitForExit` rather than folded into it, because the two answer
+    // different questions: the process has ended, versus the process has ended AND its output is
+    // complete. A stream assertion needs the second.
+    waitForClose: waitForClose,
     stop: stop,
     cleanup: cleanup
   };

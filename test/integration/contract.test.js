@@ -102,15 +102,22 @@ afterEach(async () => {
   // the test that created it. A runner that will not exit is reporting a leak to be fixed here,
   // never one to be masked by forcibly terminating the run.
   if (server) {
-    // Persistent connections opened by the cases below would otherwise keep `close()` pending
-    // until the runtime's own idle timeout elapsed.
-    if (typeof server.closeAllConnections === 'function') {
-      server.closeAllConnections();
-    }
     if (server.listening) {
-      await new Promise((resolve) => {
+      // ORDER IS LOAD-BEARING: request the close FIRST, then drop what is still connected.
+      // `close()` stops the listener accepting anything new and completes when the last
+      // connection has gone, so the keep-alive connections the cases below open would otherwise
+      // keep it pending until the runtime's own idle timeout elapsed - which is why
+      // `closeAllConnections()` is needed at all. Force-closing first would leave a window in
+      // which the listener is still accepting, letting a connection arrive between the two calls
+      // and keep the server alive; Node's guidance is to force-close only after the close has
+      // been requested.
+      const closed = new Promise((resolve) => {
         server.close(resolve);
       });
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
+      await closed;
     }
     server = null;
   }
@@ -257,7 +264,7 @@ describe('input inertness', () => {
     ]
   ];
 
-  test.each(injections)('never reflects %s (F-001-RQ-002)', async (_label, sentinels, send) => {
+  test.each(injections)('never reflects %s (F-001-RQ-002, ST-4)', async (_label, sentinels, send) => {
     const res = await send(request(server));
     expect(res.status).toBe(expected.STATUS);
     expect(res.text).toBe(expected.BODY);
@@ -305,7 +312,7 @@ describe('runtime-produced semantics', () => {
     expect(res.headers[FRAMING_HEADER]).toBeUndefined();
   });
 
-  test('yields exactly one unique response across fifty sequential requests (F-001-RQ-003)', async () => {
+  test('yields exactly one unique response across fifty sequential requests (F-001-RQ-003, ST-5)', async () => {
     const seen = new Set();
     // The path varies on every iteration and each request is awaited before the next begins, so
     // any path-dependent or accumulated variation in the response would show up here as a second
